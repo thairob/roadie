@@ -156,6 +156,12 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
   font-size: 6vh; padding: 2vh 5vw; border-radius: 2vh; white-space: nowrap;
 }
 
+#nosound {
+  position: absolute; bottom: calc(var(--safe-b) + 2vh); left: 50%; transform: translateX(-50%);
+  z-index: 30; background: var(--bad); color: #fff; font-weight: 800;
+  font-size: 5.5vh; padding: 2.5vh 4vw; border-radius: 2vh; white-space: nowrap;
+}
+
 #paused, #done {
   position: absolute; inset: 0; z-index: 20;
   background: rgba(0,0,0,0.88);

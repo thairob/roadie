@@ -115,13 +115,30 @@ function fmtSpoken(sec) {
    ========================================================= */
 let ctx = null, master = null, noiseBuf = null;
 
-function ensureAudio() {
+function ensureAudio(rebuild) {
   // Must be called from inside a tap so iOS lets audio start.
   // Play through the silent switch on newer iOS (set before audio starts)
   try { if (navigator.audioSession && navigator.audioSession.type !== 'playback') navigator.audioSession.type = 'playback'; } catch (e) {}
+  // If iPhone has shut the sound off, throw the old sound engine away and make a fresh one
+  if (ctx && rebuild && ctx.state !== 'running') {
+    try { ctx.close(); } catch (e) {}
+    ctx = null;
+  }
   if (!ctx) {
     const AC = window.AudioContext || window.webkitAudioContext;
     ctx = new AC();
+    // If iPhone interrupts the sound (for example while the voice talks), try to bring it straight back
+    ctx.onstatechange = () => {
+      if (ctx && ctx.state !== 'running' && ctx.state !== 'closed' && S.active) {
+        try { ctx.resume(); } catch (e) {}
+      }
+    };
+    // A silent sound that plays the whole time keeps iPhone from putting the audio to sleep
+    const silent = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+    const keep = ctx.createBufferSource();
+    keep.buffer = silent; keep.loop = true;
+    keep.connect(ctx.destination);
+    keep.start();
     master = ctx.createGain();
     master.connect(ctx.destination);
     // White noise buffer for the hi-hat sound
@@ -412,10 +429,16 @@ function tick() {
   if (!S.active) return;
   Metro.poll();
   const t = now();
-  if (ctx && ctx.state !== 'running' && (S.phase === 'countin' || S.phase === 'play') && t - (S.lastResume || 0) > 1) {
+  const soundOff = !!ctx && ctx.state !== 'running' && (S.phase === 'countin' || S.phase === 'play');
+  if (soundOff && t - (S.lastResume || 0) > 1) {
     S.lastResume = t;
     try { ctx.resume(); } catch (e) {}
   }
+  // Only show the "no sound" banner if the sound has been off for more than a second
+  if (soundOff) { if (!S.soundOffSince) S.soundOffSince = t; } else S.soundOffSince = 0;
+  const showBanner = soundOff && t - S.soundOffSince > 1;
+  const nb = $('nosound');
+  if (nb.hidden === showBanner) nb.hidden = !showBanner;
   if (S.phase === 'break') {
     // Wait for both the break timer and the voice cue, so we never talk over the count-in
     // Backups in case iPhone never reports that the voice finished
@@ -423,6 +446,13 @@ function tick() {
                          && t > S.speechStartedAt + 1.5;
     const speechTimeout = t > S.breakEnd + 8;
     if (t >= S.breakEnd && (S.speechDone || speechSilent || speechTimeout)) {
+      // Give the sound a moment to come back after the voice before counting in
+      if (ctx && ctx.state !== 'running') {
+        if (!S.audioWaitUntil) S.audioWaitUntil = t + 2.5;
+        try { ctx.resume(); } catch (e) {}
+        if (t < S.audioWaitUntil) { renderLive(); return; }
+      }
+      S.audioWaitUntil = 0;
       enterCountIn(S.segs[S.i].duration);
       return;
     }
@@ -637,6 +667,13 @@ function renderLive() {
   zones.addEventListener('contextmenu', e => e.preventDefault());
 
   $('undo').addEventListener('pointerup', e => { e.stopPropagation(); doUndo(); });
+  $('nosound').addEventListener('pointerup', e => {
+    e.stopPropagation();
+    ensureAudio(true);
+    $('nosound').hidden = true;
+    S.soundOffSince = 0;
+    if (S.phase === 'countin' || S.phase === 'play') enterCountIn(Math.max(1, currentRemaining()));
+  });
   $('btn-resume').addEventListener('click', e => { e.stopPropagation(); resume(); });
   $('btn-end').addEventListener('click', e => { e.stopPropagation(); endSession(); });
   $('btn-done').addEventListener('click', endSession);
