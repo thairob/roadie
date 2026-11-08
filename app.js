@@ -2426,131 +2426,197 @@ $('picker').addEventListener('click', e => {
   if (pickerKind === 'triad' || pickerKind === 'drill') closePicker();   // usually just one of these at a time
 });
 
-/* ---------- Surprise me (Phase 5) ---------- */
+/* ---------- Surprise me (Phase 5, reworked) ---------- */
+// Kinds in Rob's ranked order. The higher a kind is ranked, the bigger its share of the time.
 const SURPRISE_KINDS = [
-  { id: 'exercise', label: '🎸 Warm-up exercises' },
-  { id: 'scale', label: '🎼 Scale guide' },
+  { id: 'exercise', label: '🎸 Exercises' },
   { id: 'triad', label: '🔺 Triads' },
+  { id: 'scale', label: '🎼 Scale guide' },
   { id: 'drill', label: '🎯 Note finder & call and response' },
   { id: 'band', label: '🥁 Backing tracks' },
   { id: 'song', label: '🎵 My songs' }
 ];
+const RANK_WEIGHTS = [30, 22, 17, 13, 10, 8];
+const SURPRISE_BREAK = 8;
 const COMMON_KEYS = [9, 4, 7, 2, 0];           // A, E, G, D, C — friendly guitar keys
 const rnd = a => a[Math.floor(Math.random() * a.length)];
+const rndInt = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
 let surprisePlan = null;
 
 function surpriseChoices() {
-  const d = { mins: 20, kinds: { exercise: true, scale: true, triad: true, drill: true, band: true, song: true } };
+  const ids = SURPRISE_KINDS.map(k => k.id);
   const c = settings.surprise || {};
-  return { mins: c.mins || d.mins, kinds: Object.assign({}, d.kinds, c.kinds || {}) };
+  let order = Array.isArray(c.order) ? c.order.filter(id => ids.includes(id)) : [];
+  ids.forEach(id => { if (!order.includes(id)) order.push(id); });
+  const on = Object.assign({}, ...ids.map(id => ({ [id]: true })), c.on || c.kinds || {});
+  return { mins: c.mins || 20, order, on };
 }
 function songsWithAudio() { return songs.filter(x => audioIds.has(x.id) && x.sections.length); }
+const kindOf = it => it.type === 'song' ? 'song' : it.type === 'prog' ? 'band' : it.type === 'scale' ? 'scale'
+  : it.type === 'triad' ? 'triad' : (it.type === 'noteFind' || it.type === 'callResp') ? 'drill' : 'exercise';
 
-// One item of a kind, sized to last roughly `target` seconds
-function surpriseItem(kind, target, used) {
+// How long one item takes in a session, including its count-in and the break before it
+function itemSeconds(it) {
+  const segs = buildSegments({ breakSec: SURPRISE_BREAK, items: [it] });
+  return segs.reduce((t, s, k) => t + s.duration + (k ? s.breakBefore : 0) + (s.bpm ? 4 * 60 / s.bpm : 2), SURPRISE_BREAK);
+}
+
+// One fresh item of a kind. Each kind has its own natural length; `st` keeps them varied.
+function surpriseItem(kind, st) {
   if (kind === 'exercise') {
-    const pool = exercises.filter(e => !used.has('ex:' + e.id));
+    let pool = exercises.filter(e => !st.exUsed.has(e.id));
+    if (!pool.length) { st.exUsed.clear(); pool = exercises.filter(e => e.id !== st.lastEx); }
     const ex = rnd(pool.length ? pool : exercises);
-    used.add('ex:' + ex.id);
-    return { exId: ex.id, name: ex.name, bpm: ex.bpm, duration: clamp(Math.round(target / 15) * 15, 45, 240), ladder: null };
+    st.exUsed.add(ex.id); st.lastEx = ex.id;
+    return { exId: ex.id, name: ex.name, bpm: ex.bpm, duration: st.warmup ? 60 : rnd([60, 75, 90, 105, 120]), ladder: null };
   }
   if (kind === 'scale') {
     const scale = rnd(['minPent', 'minPent', 'minPent', 'majPent', 'minBlues', 'minor', 'major', 'dorian', 'mixo']);
-    const key = rnd(COMMON_KEYS), p = 1 + Math.floor(Math.random() * 5), bpm = rnd([70, 75, 80, 85, 90]);
+    const key = rnd(COMMON_KEYS), p = rndInt(1, 5), bpm = rnd([70, 75, 80, 85, 90]);
     const n = Theory.position(key, scale, p).notes.length;
-    const rounds = clamp(Math.round(target * bpm / 60 / (2 * (n - 1))), 1, 6);
+    const target = rndInt(90, 150);
+    const rounds = clamp(Math.round(target * bpm / 60 / (2 * (n - 1))), 1, 4);
     return { type: 'scale', key, scale, bpm, positions: p, rounds, posBreak: 4, labels: 'degrees', tones: true };
   }
   if (kind === 'triad') {
-    if (Math.random() < 0.5) {
-      return { type: 'triad', mode: 'walk', keys: [rnd(COMMON_KEYS)], quality: rnd(['major', 'minor']), strings: Math.random() < 0.7 ? 'gbe' : 'dgb', bpm: 70, bars: 2, sayNames: true, shuffle: false, labels: 'degrees' };
+    st.triadFlip = !st.triadFlip;
+    const invs = rnd([[0, 1, 2], [0, 1, 2], [0], [1], [2]]);
+    if (st.triadFlip) {
+      // walk through a few keys so it lasts at least about a minute
+      const keys = shuffleList(COMMON_KEYS.slice());
+      const it = { type: 'triad', mode: 'walk', keys: [keys[0]], quality: rnd(['major', 'minor']), invs, strings: Math.random() < 0.7 ? 'gbe' : 'dgb', bpm: 70, bars: invs.length === 3 ? 2 : 4, sayNames: true, shuffle: false, labels: 'degrees' };
+      const playing = x => buildSegments({ breakSec: SURPRISE_BREAK, items: [x] }).reduce((t, g) => t + g.duration, 0);
+      while (playing(it) < 60 && it.keys.length < keys.length) it.keys.push(keys[it.keys.length]);
+      return it;
     }
-    return { type: 'triad', mode: 'quiz', keys: COMMON_KEYS.slice(0, 4), quality: 'both', strings: 'gbe', bpm: 70, prompts: clamp(Math.round(target / 8), 4, 20), timing: 'secs', findSecs: 5, revealSecs: 3, findBars: 2, revealBars: 1, labels: 'degrees' };
+    return { type: 'triad', mode: 'quiz', keys: shuffleList(COMMON_KEYS.slice()).slice(0, 3), quality: 'both', invs, strings: 'gbe', bpm: 70, prompts: rndInt(8, 12), timing: 'secs', findSecs: 5, revealSecs: 3, findBars: 2, revealBars: 1, labels: 'degrees' };
   }
   if (kind === 'drill') {
-    if (Math.random() < 0.55) {
-      return { type: 'noteFind', keys: NATURALS.slice(), strs: [0, 1, 2, 3, 4, 5], mode: 'mix', maxFret: 12, bpm: 70, prompts: clamp(Math.round(target / 8), 4, 20), timing: 'secs', findSecs: 5, revealSecs: 3, findBars: 2, revealBars: 1 };
+    st.drillFlip = !st.drillFlip;
+    if (st.drillFlip) {
+      return { type: 'noteFind', keys: NATURALS.slice(), strs: rnd([[0, 1, 2, 3, 4, 5], [0, 1], [2, 3], [4, 5], [0, 1, 2]]), mode: 'mix', maxFret: 12, bpm: 70, prompts: rndInt(10, 14), timing: 'secs', findSecs: 5, revealSecs: 3, findBars: 2, revealBars: 1 };
     }
-    return { type: 'callResp', key: rnd(COMMON_KEYS), scale: rnd(['minPent', 'minPent', 'majPent']), p: 1, bpm: 70, prompts: clamp(Math.round(target / 12), 4, 15), len: 3, maxLen: 6, labels: 'degrees' };
+    return { type: 'callResp', key: rnd(COMMON_KEYS), scale: rnd(['minPent', 'minPent', 'majPent']), p: rndInt(1, 2), bpm: 70, prompts: rndInt(6, 8), len: 3, maxLen: 5, labels: 'degrees' };
   }
   if (kind === 'band') {
-    const prog = rnd(Theory.PROG_ORDER), pr = Theory.PROGRESSIONS[prog];
-    const it = { type: 'prog', mode: rnd(['play', 'play', 'tones', 'triads']), key: rnd(COMMON_KEYS), prog, feel: prog === 'blues' && Math.random() < 0.5 ? 'shuffle' : 'straight', bpm: pr.bpm, barsPer: 2, reps: 1, scale: pr.scale, p: 1, strings: 'gbe' };
-    const loop = progSegments(it, 0, 0)[0].duration;
-    it.reps = clamp(Math.round(target / loop), 1, 20);
+    const progs = Theory.PROG_ORDER.filter(x => x !== st.lastProg);
+    const prog = rnd(progs.length ? progs : Theory.PROG_ORDER), pr = Theory.PROGRESSIONS[prog];
+    st.lastProg = prog;
+    const it = { type: 'prog', mode: rnd(['play', 'play', 'tones', 'triads']), key: rnd(COMMON_KEYS), prog, feel: prog === 'blues' && Math.random() < 0.5 ? 'shuffle' : 'straight', bpm: pr.bpm, barsPer: pr.oneBar ? 1 : rnd([1, 2]), reps: 2, scale: pr.scale, p: 1, strings: 'gbe' };
+    const loop = progSegments(Object.assign({}, it, { reps: 1 }), 0, 0)[0].duration;
+    it.reps = Math.max(2, Math.round(rndInt(90, 150) / loop));      // always at least twice through
     return it;
   }
   if (kind === 'song') {
     const all = [];
     songsWithAudio().forEach(x => x.sections.forEach(sec => all.push({ song: x, sec })));
-    const fresh = all.filter(o => !used.has('song:' + o.sec.id));
+    const fresh = all.filter(o => !st.songUsed.has(o.sec.id));
     const { song, sec } = rnd(fresh.length ? fresh : all);
-    used.add('song:' + sec.id);
-    return { type: 'song', songId: song.id, sectionId: sec.id, speed: 100, mode: 'time', amount: clamp(Math.round(target / 15) * 15, 60, 300), rewind: 15, ladder: null };
+    st.songUsed.add(sec.id);
+    const len = Math.max(1, sec.end - sec.start);
+    // the whole section at least once; short sections loop for a minute or two
+    const loops = len >= 75 ? 1 : clamp(Math.round(rndInt(75, 120) / len), 2, 12);
+    return { type: 'song', songId: song.id, sectionId: sec.id, speed: 100, mode: 'loops', amount: loops, rewind: 15, ladder: null };
   }
   return null;
 }
 
-// Make one surprise item about `d` seconds longer (or shorter, if d is negative)
+function buildSurprise(mins, order, on) {
+  const total = mins * 60;
+  const st = { exUsed: new Set(), songUsed: new Set(), lastEx: null, lastProg: null, triadFlip: Math.random() < 0.5, drillFlip: Math.random() < 0.5, warmup: false };
+  let kinds = order.filter(id => on[id]);
+  if (!songsWithAudio().length) kinds = kinds.filter(id => id !== 'song');
+  if (!exercises.length) kinds = kinds.filter(id => id !== 'exercise');
+
+  // 1. Warm-up block: 2–3 different exercises, about a minute each — always first
+  const warm = [];
+  if (exercises.length) {
+    st.warmup = true;
+    const n = Math.min(exercises.length, mins <= 15 ? 2 : 3);
+    for (let k = 0; k < n; k++) warm.push(surpriseItem('exercise', st));
+    st.warmup = false;
+  }
+  let used = warm.reduce((t, it) => t + itemSeconds(it), 0);
+  if (!kinds.length) return warm.length ? { id: 'surprise', name: `Surprise · ${mins} min`, breakSec: SURPRISE_BREAK, items: warm } : null;
+
+  // 2. Share the rest of the time by rank, then fill each kind's share with short items
+  const w = RANK_WEIGHTS.slice(0, kinds.length), wsum = w.reduce((a, b) => a + b, 0);
+  const rest = Math.max(0, total - used);
+  const share = Object.fromEntries(kinds.map((k, i) => [k, rest * w[i] / wsum]));
+  const spent = Object.fromEntries(kinds.map(k => [k, 0]));
+  const pool = [];
+  for (let guard = 0; guard < 80; guard++) {
+    const left = total - used;
+    if (left < 50) break;
+    // the kind furthest behind its share goes next
+    const k = kinds.slice().sort((a, b) => (share[b] - spent[b]) - (share[a] - spent[a]))[0];
+    if (share[k] - spent[k] < -60 && pool.length) break;
+    const it = surpriseItem(k, st);
+    if (!it) break;
+    const sec = itemSeconds(it);
+    if (sec > left + 60 && pool.length) { spent[k] += sec; continue; }   // too long to fit — try another kind
+    pool.push(it); used += sec; spent[k] += sec;
+  }
+
+  // 3. Order: mix the kinds so the same one never comes twice in a row,
+  //    saving a backing track or song for the end when there is one
+  let finale = null;
+  const finIdx = pool.map((it, i) => ['band', 'song'].includes(kindOf(it)) ? i : -1).filter(i => i >= 0);
+  if (finIdx.length) finale = pool.splice(rnd(finIdx), 1)[0];
+  const ordered = [];
+  const left = pool.slice();
+  let last = 'exercise';                      // the warm-up block ends on an exercise
+  while (left.length) {
+    const counts = {};
+    left.forEach(it => { const k = kindOf(it); counts[k] = (counts[k] || 0) + 1; });
+    const choices = Object.keys(counts).filter(k => k !== last);
+    const pickKind = choices.length
+      ? choices.sort((a, b) => counts[b] - counts[a] || Math.random() - 0.5)[0]
+      : last;
+    const idx = left.findIndex(it => kindOf(it) === pickKind);
+    ordered.push(left.splice(idx, 1)[0]);
+    last = pickKind;
+  }
+  if (finale) {
+    // keep the finale from repeating the kind just before it
+    if (ordered.length && kindOf(ordered[ordered.length - 1]) === kindOf(finale)) {
+      const swap = ordered.findIndex((it, i) => i < ordered.length - 1 && kindOf(it) !== kindOf(finale));
+      if (swap >= 0) ordered.push(ordered.splice(swap, 1)[0]);
+    }
+    ordered.push(finale);
+  }
+  const plan = { id: 'surprise', name: `Surprise · ${mins} min`, breakSec: SURPRISE_BREAK, items: warm.concat(ordered) };
+
+  // 4. Fine-tune so the total lands close to the time asked for
+  for (let pass = 0; pass < 10; pass++) {
+    const diff = total - routineTotalSec(plan);
+    if (Math.abs(diff) <= Math.max(30, total * 0.04)) break;
+    const flex = plan.items.slice(warm.length).filter(it => it.type !== 'triad' || it.mode === 'quiz');
+    if (!flex.length) break;
+    flex.forEach(it => adjustSurpriseItem(it, diff / flex.length));
+  }
+  return plan;
+}
+
+// Make one surprise item about `d` seconds longer (or shorter) — within each kind's sensible range
 function adjustSurpriseItem(it, d) {
-  if (!it.type) { it.duration = clamp(Math.round((it.duration + d) / 15) * 15, 45, 360); return; }
-  if (it.type === 'song') { it.amount = clamp(Math.round((it.amount + d) / 15) * 15, 60, 420); return; }
-  if (it.type === 'noteFind' || (it.type === 'triad' && it.mode === 'quiz')) { it.prompts = clamp(it.prompts + Math.round(d / 8), 4, 30); return; }
-  if (it.type === 'callResp') { it.prompts = clamp(it.prompts + Math.round(d / 12), 4, 20); return; }
+  if (!it.type) { it.duration = clamp(Math.round((it.duration + d) / 15) * 15, 45, 150); return; }
+  if (it.type === 'song') {
+    const sec = findSection(findSong(it.songId), it.sectionId), len = sec ? Math.max(1, sec.end - sec.start) : 60;
+    it.amount = clamp(it.amount + Math.round(d / len), 1, 12);
+    return;
+  }
+  if (it.type === 'noteFind' || (it.type === 'triad' && it.mode === 'quiz')) { it.prompts = clamp(it.prompts + Math.round(d / 8), 5, 20); return; }
+  if (it.type === 'callResp') { it.prompts = clamp(it.prompts + Math.round(d / 12), 4, 12); return; }
   if (it.type === 'scale') {
     const n = Theory.position(it.key, it.scale, it.positions).notes.length;
-    it.rounds = clamp(it.rounds + Math.round(d * it.bpm / 60 / (2 * (n - 1))), 1, 8);
+    it.rounds = clamp(it.rounds + Math.round(d * it.bpm / 60 / (2 * (n - 1))), 1, 5);
     return;
   }
   if (it.type === 'prog') {
     const loop = progSegments(Object.assign({}, it, { reps: 1 }), 0, 0)[0].duration;
-    it.reps = clamp(it.reps + Math.round(d / loop), 1, 20);
+    it.reps = clamp(it.reps + Math.round(d / loop), 2, 12);
   }
-}
-
-function buildSurprise(mins, kinds) {
-  const total = mins * 60, brk = 10;
-  let enabled = SURPRISE_KINDS.map(k => k.id).filter(id => kinds[id]);
-  if (!songsWithAudio().length) enabled = enabled.filter(id => id !== 'song');
-  if (!exercises.length) enabled = enabled.filter(id => id !== 'exercise');
-  if (!enabled.length) return null;
-  const count = clamp(Math.round(total / 210), 2, 18);       // roughly 3½ minutes per item
-  const target = Math.max(45, (total - count * brk) / count);
-  // order: a warm-up first, then the rest mixed so no kind comes twice in a row,
-  // finishing on a backing track or a song when those are included
-  const order = [];
-  const middle = enabled.filter(k => k !== 'exercise' || enabled.length === 1);
-  if (enabled.includes('exercise')) order.push('exercise');
-  const finisher = ['band', 'song'].filter(k => enabled.includes(k));
-  let bag = [];
-  while (order.length < count - (finisher.length ? 1 : 0)) {
-    if (!bag.length) bag = shuffleList(middle.slice());
-    let k = bag.shift();
-    if (k === order[order.length - 1] && bag.length) { bag.push(k); k = bag.shift(); }
-    order.push(k);
-  }
-  if (finisher.length) {
-    // finish on a backing track or song — preferably one that hasn't come up yet, and never twice in a row
-    const fresh = finisher.filter(x => !order.includes(x) && x !== order[order.length - 1]);
-    const ok = finisher.filter(x => x !== order[order.length - 1]);
-    order.push(rnd(fresh.length ? fresh : ok.length ? ok : finisher));
-  }
-  const used = new Set();
-  const plan = { id: 'surprise', name: `Surprise · ${mins} min`, breakSec: brk, items: [] };
-  for (const k of order.slice(0, count)) {
-    const it = surpriseItem(k, target, used);
-    if (it) plan.items.push(it);
-  }
-  // Fine-tune: stretch or shrink the items that can change length until the total lands close
-  for (let pass = 0; pass < 12; pass++) {
-    const diff = total - routineTotalSec(plan);
-    if (Math.abs(diff) <= Math.max(30, total * 0.04)) break;
-    const flex = plan.items.filter(it => it.type !== 'triad' || it.mode === 'quiz');
-    if (!flex.length) break;
-    const share = diff / flex.length;
-    flex.forEach(it => adjustSurpriseItem(it, share));
-  }
-  return plan;
 }
 
 function renderSurprise(keepPlan) {
@@ -2558,43 +2624,60 @@ function renderSurprise(keepPlan) {
   const v = $('view'), c = surpriseChoices();
   const hasSongs = songsWithAudio().length > 0;
   if (!keepPlan) surprisePlan = null;
+  const active = c.order.filter(id => c.on[id] && (id !== 'song' || hasSongs));
+  const w = RANK_WEIGHTS.slice(0, active.length), wsum = w.reduce((a, b) => a + b, 0) || 1;
   let html = `<div class="row"><button class="btn small" id="spBack">‹ Back</button></div>
     <h1>🎲 Surprise me</h1>
     <h2>How long?</h2>
     <div class="chips">${[10, 15, 20, 30, 45, 60].map(m => `<button class="chip${c.mins === m ? ' on' : ''}" data-mins="${m}">${m}</button>`).join('')}</div>
-    <p class="muted" style="text-align:center;margin:6px 0 0">minutes</p>
-    <h2>Include</h2>
-    <div class="card">${SURPRISE_KINDS.map(k => {
-      const off = k.id === 'song' && !hasSongs;
-      return `<label class="toggle"><span>${k.label}${off ? ' <small class="muted">(import a song first)</small>' : ''}</span>
-        <input type="checkbox" data-kind="${k.id}" ${c.kinds[k.id] && !off ? 'checked' : ''} ${off ? 'disabled' : ''}></label>`;
+    <p class="muted" style="text-align:center;margin:6px 0 0">minutes · always starts with a short warm-up</p>
+    <h2>What do you want most?</h2>
+    <p class="muted" style="margin-top:-4px">Put them in order with the arrows. The top gets the most time. Untick anything you don't want.</p>
+    <div class="card rank">${c.order.map((id, i) => {
+      const k = SURPRISE_KINDS.find(x => x.id === id);
+      const off = id === 'song' && !hasSongs;
+      const pos = active.indexOf(id);
+      const pct = pos >= 0 ? Math.round(100 * w[pos] / wsum) + '%' : '';
+      return `<div class="rank-row${c.on[id] && !off ? '' : ' off'}">
+        <span class="rk">${pos >= 0 ? pos + 1 : '–'}</span>
+        <span class="rn">${k.label}${off ? ' <small class="muted">(import a song first)</small>' : ''}</span>
+        <span class="rp muted">${pct}</span>
+        <button class="btn small" data-up="${i}" ${i === 0 ? 'disabled' : ''} aria-label="Move up">▲</button>
+        <button class="btn small" data-down="${i}" ${i === c.order.length - 1 ? 'disabled' : ''} aria-label="Move down">▼</button>
+        <input type="checkbox" data-on="${id}" ${c.on[id] && !off ? 'checked' : ''} ${off ? 'disabled' : ''}>
+      </div>`;
     }).join('')}</div>
     <button class="btn wide primary start" id="spBuild">🎲 ${surprisePlan ? 'Shuffle again' : 'Build my session'}</button>`;
   if (surprisePlan) {
-    const segs = buildSegments(surprisePlan);
-    html += `<h2>Your session · about ${fmtShort(routineTotalSec(surprisePlan))}</h2><div class="card">` +
+    const n = surprisePlan.items.length;
+    html += `<h2>Your session · ${n} items · about ${fmtShort(routineTotalSec(surprisePlan))}</h2><div class="card">` +
       surprisePlan.items.map((it, k) => {
-        const dur = segs.filter(x => x.item === k).reduce((t, x) => t + x.duration, 0);
+        const segs = buildSegments({ breakSec: SURPRISE_BREAK, items: [it] });
+        const dur = segs.reduce((t, x) => t + x.duration, 0);
         return `<div class="sp-row"><span>${k + 1}. ${esc(itemName(it))}</span><span class="muted">${fmtShort(dur)}</span></div>`;
       }).join('') + `</div>
       <button class="btn wide primary start" id="spStart">▶ Start</button>
       <button class="btn wide" id="spSave">💾 Save as routine</button>`;
   }
+  const y = window.scrollY;
   v.innerHTML = html;
-  window.scrollTo(0, keepPlan ? document.body.scrollHeight : 0);
+  window.scrollTo(0, keepPlan === 'stay' ? y : keepPlan ? document.body.scrollHeight : 0);
 
-  const save = () => { settings.surprise = c; saveSettings(); };
+  const save = () => { settings.surprise = { mins: c.mins, order: c.order, on: c.on }; saveSettings(); };
+  const redraw = () => { save(); surprisePlan = null; renderSurprise('stay'); };
   $('spBack').addEventListener('click', () => showTab('routines'));
-  v.querySelectorAll('[data-mins]').forEach(b => b.addEventListener('click', () => {
-    c.mins = +b.dataset.mins; save(); surprisePlan = null; renderSurprise(false);
+  v.querySelectorAll('[data-mins]').forEach(b => b.addEventListener('click', () => { c.mins = +b.dataset.mins; redraw(); }));
+  v.querySelectorAll('[data-up]').forEach(b => b.addEventListener('click', () => {
+    const i = +b.dataset.up; [c.order[i - 1], c.order[i]] = [c.order[i], c.order[i - 1]]; redraw();
   }));
-  v.querySelectorAll('input[data-kind]').forEach(el => el.addEventListener('change', () => {
-    c.kinds[el.dataset.kind] = el.checked; save();
+  v.querySelectorAll('[data-down]').forEach(b => b.addEventListener('click', () => {
+    const i = +b.dataset.down; [c.order[i + 1], c.order[i]] = [c.order[i], c.order[i + 1]]; redraw();
   }));
+  v.querySelectorAll('input[data-on]').forEach(el => el.addEventListener('change', () => { c.on[el.dataset.on] = el.checked; redraw(); }));
   $('spBuild').addEventListener('click', () => {
     save();
-    const plan = buildSurprise(c.mins, c.kinds);
-    if (!plan || !plan.items.length) { toast('Pick at least one kind of practice'); return; }
+    const plan = buildSurprise(c.mins, c.order, c.on);
+    if (!plan || !plan.items.length) { toast('Add an exercise or tick at least one kind'); return; }
     surprisePlan = plan;
     renderSurprise(true);
   });
