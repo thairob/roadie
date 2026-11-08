@@ -217,7 +217,108 @@ const Theory = (() => {
     return svg + '</svg>';
   }
 
+  /* ---------- Note finder ---------- */
+  const STRING_NAMES = ['low E', 'A', 'D', 'G', 'B', 'high E'];
+  const STRING_SHORT = ['E', 'A', 'D', 'G', 'B', 'e'];
+
+  // Every place a note appears on the chosen strings, up to a fret
+  function notePlaces(pc, strings, maxFret) {
+    const out = [];
+    for (const s of strings) for (let f = 0; f <= maxFret; f++) if (pcOf(OPEN[s] + f) === pcOf(pc)) out.push({ s, f });
+    return out;
+  }
+
+  /* ---------- Call and response phrases ---------- */
+  // Short phrases inside one scale position: mostly steps, the odd small leap,
+  // and phrases of 3+ notes end on a root so they sound finished.
+  function makePhrases(rootPc, scaleId, p, count, startLen, maxLen, growEvery) {
+    const notes = position(rootPc, scaleId, p).notes;          // low → high
+    const roots = notes.map((n, k) => n.root ? k : -1).filter(k => k >= 0);
+    const phrases = [];
+    let prevStart = -1;
+    for (let k = 0; k < count; k++) {
+      const len = Math.min(maxLen, startLen + Math.floor(k / Math.max(1, growEvery)));
+      // start near a root (or anywhere in the middle of the box), but not the same start twice
+      let idx;
+      do {
+        idx = Math.random() < 0.5 && roots.length
+          ? roots[Math.floor(Math.random() * roots.length)]
+          : 2 + Math.floor(Math.random() * Math.max(1, notes.length - 4));
+      } while (idx === prevStart && notes.length > 3 && Math.random() < 0.8);
+      prevStart = idx;
+      const seq = [idx];
+      let dir = Math.random() < 0.5 ? -1 : 1;
+      const body = len >= 3 ? len - 1 : len;          // the last note is added below
+      for (let j = 1; j < body; j++) {
+        if (Math.random() < 0.25) dir = -dir;
+        const step = Math.random() < 0.75 ? 1 : 2;
+        let nx = seq[seq.length - 1] + dir * step;
+        if (nx < 0 || nx >= notes.length) { dir = -dir; nx = seq[seq.length - 1] + dir * step; }
+        seq.push(clampIdx(nx, notes.length));
+      }
+      if (len >= 3 && roots.length) {
+        // the note before the end shouldn't already be a root, so the ending moves somewhere
+        let cur = seq[seq.length - 1];
+        if (notes[cur].root) {
+          const alt = cur + dir >= 0 && cur + dir < notes.length ? cur + dir : cur - dir;
+          seq[seq.length - 1] = cur = clampIdx(alt, notes.length);
+        }
+        let best = roots[0];
+        for (const r of roots) if (Math.abs(r - cur) < Math.abs(best - cur)) best = r;
+        seq.push(best);
+      }
+      phrases.push(seq.map(i => notes[i]));
+    }
+    return { notes, phrases };
+  }
+  const clampIdx = (i, n) => Math.max(0, Math.min(n - 1, i));
+
+  /* ---------- Micro-lessons: one-sentence tips, easy to harder ---------- */
+  const TIPS = [
+    'The musical alphabet has only seven letters, A to G, and then it starts over.',
+    'There is a sharp or flat between most natural notes, except between B and C, and between E and F.',
+    'One fret is a half step, and two frets is a whole step.',
+    'The 12th fret is the same note as the open string, one octave higher.',
+    'The low E and high E strings have the same notes, two octaves apart.',
+    'The 5th fret of each string matches the next open string, except on the G string, where it is the 4th fret.',
+    'Sharps and flats can be two names for the same note, like C sharp and D flat.',
+    'For an octave from the low E or A string, go up two strings and two frets.',
+    'When you learn a riff, say the note names as you play them. It builds fretboard knowledge fast.',
+    'Playing a scale up and down a single string shows how its notes are laid out along the neck.',
+    'The major scale follows the pattern whole, whole, half, whole, whole, whole, half.',
+    'The minor pentatonic has five notes: the root, flat 3, 4, 5 and flat 7.',
+    'Learn where the roots are in each scale position. They are your home base when you improvise.',
+    'The five pentatonic positions link together: the top of one position is the bottom of the next.',
+    'Every major key has a relative minor three frets below its root, and they share the same notes, like C major and A minor.',
+    'A minor pentatonic and C major pentatonic use exactly the same notes and shapes.',
+    'The blues scale is the minor pentatonic plus one extra note, the flat 5, often called the blue note.',
+    'Bending the flat 3 of the minor pentatonic up a little gives that classic bluesy sound.',
+    'An interval is the distance between two notes: a fourth is five frets, and a fifth is seven.',
+    'A power chord is just the root and the fifth. With no third, it is neither major nor minor.',
+    'A triad is three notes stacked in thirds: the root, the third and the fifth.',
+    'A major chord has a major third, four frets above the root. A minor chord has a minor third, just three frets above.',
+    'To turn a major chord into a minor chord, lower its third by one fret.',
+    'In first inversion the third is the lowest note. In second inversion the fifth is the lowest note.',
+    'Learning one triad shape in every key is a great way to learn the whole neck.',
+    'Chords in a key are numbered with Roman numerals: capitals for major chords, lower case for minor.',
+    'In any major key, the one, four and five chords are major, and the two, three and six chords are minor.',
+    'In the key of G, the one, four and five chords are G, C and D.',
+    'A 12-bar blues uses just three chords: the one, the four and the five.',
+    'The five chord builds tension that wants to resolve back to the one chord.',
+    'The progression minor one, flat seven, flat six is the sound of a lot of rock and metal.',
+    'Landing on the root, third or fifth of the chord that is playing sounds strong and settled.',
+    'The natural minor scale is the major scale started from its sixth note.',
+    'Dorian is a minor scale with a raised sixth, which gives minor a brighter, funkier sound.',
+    'Mixolydian is a major scale with a flat seventh. It is the sound of a lot of classic rock riffs.',
+    'The circle of fifths puts each key a fifth above the last, and neighbouring keys share all but one note.',
+    'Play a short phrase, then leave some space. Solos sound better as a conversation.',
+    'Repeat a short idea and change one note each time. It is a simple way to build a solo.',
+    'Ending a phrase on the root sounds finished, and ending on another note leaves it hanging.',
+    'Slow and clean beats fast and sloppy. Speed comes from accuracy.'
+  ];
+
   return {
+    STRING_NAMES, STRING_SHORT, notePlaces, makePhrases, TIPS,
     OPEN, MAX_FRET, TRIAD_MAX, NOTE_NAMES, CIRCLE, DEGREE, SCALES, SCALE_ORDER, STRING_SETS, INV_NAMES, INV_SHORT,
     pcOf, noteName, spokenNote, position, scalePath, wholeNeck,
     triadShapes, triadWalk, triadInstances, triadLabel, drawBoard, drawMini

@@ -75,7 +75,9 @@ const DEFAULT_SETTINGS = {
   cueDone: true,
   voiceURI: '',
   voiceRate: 1,
-  firstBreak: 5
+  firstBreak: 5,
+  tips: true,        // one-sentence theory tips in the breaks between items
+  tipIdx: 0
 };
 
 function starterRoutines() {
@@ -236,15 +238,15 @@ function playClick(time, accent) {
 }
 
 // Soft tone for the scale guide (an octave up so it's clear on a phone speaker)
-function playTone(time, midi) {
+function playTone(time, midi, level) {
   const o = ctx.createOscillator(), g = ctx.createGain();
   o.type = 'triangle';
   o.frequency.value = 440 * Math.pow(2, (midi + 12 - 69) / 12);
   g.gain.setValueAtTime(0.0001, time);
-  g.gain.linearRampToValueAtTime(0.3, time + 0.006);
-  g.gain.exponentialRampToValueAtTime(0.001, time + 0.55);
+  g.gain.linearRampToValueAtTime(level || 0.3, time + 0.006);
+  g.gain.exponentialRampToValueAtTime(0.001, time + (level ? 0.75 : 0.55));
   o.connect(g); g.connect(master);
-  o.start(time); o.stop(time + 0.6);
+  o.start(time); o.stop(time + (level ? 0.8 : 0.6));
 }
 
 const Metro = {
@@ -472,8 +474,80 @@ function songSegment(item, idx, song, sec, pct, mode, amount) {
 }
 
 /* ---------- Scale guide and triad segments (Phase 3) ---------- */
-const isBoardSeg = seg => !!seg && (seg.kind === 'scale' || seg.kind === 'triadWalk' || seg.kind === 'triadQuiz');
-function itemKeys(it) { return Array.isArray(it.keys) && it.keys.length ? it.keys.slice() : [0]; }
+const BOARD_KINDS = ['scale', 'triadWalk', 'triadQuiz', 'noteFind', 'callResp'];
+const isBoardSeg = seg => !!seg && BOARD_KINDS.includes(seg.kind);
+const NATURALS = [0, 2, 4, 5, 7, 9, 11];
+function itemStrings(it) {
+  const v = Array.isArray(it.strs) ? it.strs.filter(n => n >= 0 && n <= 5) : [];
+  return v.length ? v.sort() : [0, 1, 2, 3, 4, 5];
+}
+
+function noteFindSegments(item, idx, brk) {
+  const bpm = clamp(Math.round(num(item.bpm, 70)), 20, 300);
+  const bpb = settings.beatsPerBar;
+  const pcs = Array.isArray(item.keys) && item.keys.length ? item.keys.slice() : NATURALS.slice();
+  const strs = itemStrings(item);
+  const maxFret = clamp(Math.round(num(item.maxFret, 12)), 3, 17);
+  const n = clamp(Math.round(num(item.prompts, 10)), 1, 100);
+  const findB = clamp(Math.round(num(item.findBars, 2)), 1, 8), showB = clamp(Math.round(num(item.revealBars, 1)), 1, 8);
+  const cycle = (findB + showB) * bpb;
+  const mode = item.mode === 'every' || item.mode === 'string' ? item.mode : 'mix';
+  const prompts = [];
+  let last = '';
+  for (let k = 0; k < n; k++) {
+    let pr, tries = 0;
+    do {
+      const pc = pcs[Math.floor(Math.random() * pcs.length)];
+      const type = mode === 'mix' ? (Math.random() < 0.5 ? 'every' : 'string') : mode;
+      pr = { type, pc };
+      if (type === 'string') pr.s = strs[Math.floor(Math.random() * strs.length)];
+      tries++;
+    } while (tries < 12 && `${pr.type}${pr.pc}${pr.s}` === last);
+    last = `${pr.type}${pr.pc}${pr.s}`;
+    prompts.push(pr);
+  }
+  const dur = n * cycle * 60 / bpm;
+  return [{
+    kind: 'noteFind', item: idx, name: 'Note finder', bpm, prompts, cycle, findBeats: findB * bpb, strs, maxFret,
+    duration: dur, durText: `${n} notes`, ladder: null, tip: '', breakBefore: brk
+  }];
+}
+
+function callRespSegments(item, idx, brk) {
+  const scale = Theory.SCALES[item.scale] ? item.scale : 'minPent';
+  const key = Theory.pcOf(num(item.key, 9));
+  const p = clamp(Math.round(num(item.p, 1)), 1, 5);
+  const bpm = clamp(Math.round(num(item.bpm, 70)), 20, 300);
+  const bpb = settings.beatsPerBar;
+  const n = clamp(Math.round(num(item.prompts, 10)), 1, 60);
+  const startLen = clamp(Math.round(num(item.len, 3)), 2, 10);
+  const maxLen = clamp(Math.round(num(item.maxLen, 6)), startLen, 12);
+  const gen = Theory.makePhrases(key, scale, p, n, startLen, maxLen, 2);
+  const phrases = [];
+  let beat = 0;
+  for (const notes of gen.phrases) {
+    const cb = Math.ceil(notes.length / bpb) * bpb;   // listen, your turn, and the answer each get this many beats
+    phrases.push({ start: beat, cb, notes });
+    beat += 3 * cb;
+  }
+  const dur = beat * 60 / bpm;
+  return [{
+    kind: 'callResp', item: idx, name: 'Call and response', key, scale, p, bpm, phrases, posNotes: gen.notes,
+    title: `${Theory.noteName(key)} ${Theory.SCALES[scale].name}`,
+    spokenTitle: `${Theory.spokenNote(key)} ${Theory.SCALES[scale].name}`,
+    labels: item.labels === 'names' ? 'names' : 'degrees',
+    duration: dur, durText: `${n} phrases`, ladder: null, tip: '', breakBefore: brk
+  }];
+}
+function phraseAt(seg, step) {
+  let k = 0;
+  while (k + 1 < seg.phrases.length && seg.phrases[k + 1].start <= step) k++;
+  return k;
+}
+function itemKeys(it) {
+  if (Array.isArray(it.keys) && it.keys.length) return it.keys.slice();
+  return it.type === 'noteFind' ? [0, 2, 4, 5, 7, 9, 11] : [0];
+}
 function itemInvs(it) {
   const v = Array.isArray(it.invs) ? it.invs.filter(n => n === 0 || n === 1 || n === 2) : [];
   return v.length ? v.sort() : [0, 1, 2];
@@ -561,6 +635,8 @@ function boardAnnouncement(seg) {
     if (seg.posIdx > 0) return `Position ${seg.p}.`;
     return `Next up: ${seg.spokenName}, ${seg.all ? 'all 5 positions' : 'position ' + seg.p}, ${seg.bpm} BPM.`;
   }
+  if (seg.kind === 'noteFind') return `Next up: note finder, ${seg.prompts.length} notes. Find each one before it appears.`;
+  if (seg.kind === 'callResp') return `Next up: call and response in ${seg.spokenTitle}, position ${seg.p}. Listen, then play it back.`;
   const strings = Theory.STRING_SETS[seg.set].spoken;
   if (seg.kind === 'triadQuiz') return `Next up: triad quiz, ${seg.prompts.length} triads on the ${strings}. Find each one before it appears.`;
   const name = `${Theory.spokenNote(seg.key)} ${seg.quality}`;
@@ -575,6 +651,8 @@ function buildSegments(routine) {
   routine.items.forEach((item, idx) => {
     if (item.type === 'scale') { scaleSegments(item, idx, brk).forEach(x => segs.push(x)); return; }
     if (item.type === 'triad') { triadSegments(item, idx, brk).forEach(x => segs.push(x)); return; }
+    if (item.type === 'noteFind') { noteFindSegments(item, idx, brk).forEach(x => segs.push(x)); return; }
+    if (item.type === 'callResp') { callRespSegments(item, idx, brk).forEach(x => segs.push(x)); return; }
     if (isSongItem(item)) {
       const song = findSong(item.songId), sec = findSection(song, item.sectionId);
       if (!song || !sec) return;
@@ -700,7 +778,7 @@ async function startSession(routineId) {
   unlockSpeech();
   if (segs.some(isSongSeg)) unlockSongPlayer();
   requestWakeLock();
-  S.active = true; S.routine = routine; S.segs = segs;
+  S.active = true; S.routine = routine; S.segs = segs; S.tipFor = -1;
   $('app').hidden = true;
   $('session').hidden = false;
   $('done').hidden = true; $('paused').hidden = true; $('undo').hidden = true; $('nosound').hidden = true;
@@ -727,7 +805,17 @@ function enterBreak(i) {
   S.audioWaitUntil = 0;
   if (isSongSeg(seg)) prepareSong(seg, seg.start);
   if (isBoardSeg(seg)) { S.stepBase = 0; S.boardStep = 0; }
-  const text = announcement(seg);
+  let text = announcement(seg);
+  // A theory tip in the break between two different items (picked once per break, so pausing doesn't skip ahead)
+  if (settings.tips && settings.voiceOn && i > 0 && S.segs[i - 1].item !== seg.item) {
+    if (S.tipFor !== i) {
+      S.tipFor = i;
+      S.tipText = Theory.TIPS[settings.tipIdx % Theory.TIPS.length];
+      settings.tipIdx = (settings.tipIdx + 1) % Theory.TIPS.length;
+      saveSettings();
+    }
+    text = `Tip: ${S.tipText} ${text}`;
+  }
   // Take turns: pause Roadie's own sound so iPhone lets the voice through,
   // then the sound is switched back on before the count-in.
   const breakToken = S.breakToken = (S.breakToken || 0) + 1;
@@ -1116,12 +1204,27 @@ const Board = { key: '', els: [], cur: -1 };
 // Called as each beat is scheduled: the scale guide's soft tone lands exactly on the click
 function onSchedule(beat, time) {
   const seg = curSeg();
-  if (!seg || beat < 0 || seg.kind !== 'scale' || !seg.tones) return;
+  if (!seg || beat < 0) return;
+  if (seg.kind === 'callResp') {
+    // The phrase plays once to listen to, and again with the answer
+    const step = S.stepBase + beat, ph = seg.phrases[phraseAt(seg, step)];
+    const off = step - ph.start;
+    if (off < ph.notes.length) playTone(time, ph.notes[off].midi, 0.42);
+    else if (off >= 2 * ph.cb && off - 2 * ph.cb < ph.notes.length) playTone(time, ph.notes[off - 2 * ph.cb].midi, 0.42);
+    return;
+  }
+  if (seg.kind !== 'scale' || !seg.tones) return;
   const step = S.stepBase + beat;
   if (step < seg.path.length) playTone(time, seg.path[step].midi);
 }
 
-// Spoken cues during triad items, always right after a beat
+function noteFindText(pr) {
+  return pr.type === 'string'
+    ? `${Theory.spokenNote(pr.pc)} on the ${Theory.STRING_NAMES[pr.s]} string`
+    : `Find every ${Theory.spokenNote(pr.pc)}`;
+}
+
+// Spoken cues during triad and note-finder items, always right after a beat
 function boardCue(seg, step) {
   const bpb = settings.beatsPerBar;
   if (seg.kind === 'triadWalk' && seg.sayNames && settings.voiceOn) {
@@ -1129,6 +1232,9 @@ function boardCue(seg, step) {
     if (inShape === Math.max(0, seg.bps - bpb) && si + 1 < seg.shapes.length) {
       speak(`Next: ${Theory.INV_NAMES[seg.shapes[si + 1].inv]}`);
     }
+  } else if (seg.kind === 'noteFind' && step % seg.cycle === 0) {
+    const pr = seg.prompts[Math.floor(step / seg.cycle)];
+    if (pr) speak(noteFindText(pr) + '.');
   } else if (seg.kind === 'triadQuiz' && step % seg.cycle === 0) {
     const pr = seg.prompts[Math.floor(step / seg.cycle)];
     if (pr) speak(`${Theory.spokenNote(pr.key)} ${pr.quality}, ${Theory.INV_NAMES[pr.inv]}`);
@@ -1161,6 +1267,59 @@ function showBoard(seg, force) {
     const round = Math.min(seg.rounds, Math.floor(Math.max(0, step - 1) / roundLen) + 1);
     const cap = playing ? `Position ${seg.p} · round ${round} of ${seg.rounds}` : `Position ${seg.p} — start on the glowing note`;
     if ($('s-caption').textContent !== cap) $('s-caption').textContent = cap;
+    return;
+  }
+  if (seg.kind === 'noteFind') {
+    const pi = clamp(Math.floor(step / seg.cycle), 0, seg.prompts.length - 1);
+    const pr = seg.prompts[pi];
+    const reveal = playing && (step % seg.cycle) >= seg.findBeats;
+    const key = `nf${S.i}:${pi}:${reveal ? 1 : 0}:${playing ? 1 : 0}`;
+    if (Board.key !== key || force) {
+      const strs = pr.type === 'string' ? [pr.s] : seg.strs;
+      const notes = reveal ? Theory.notePlaces(pr.pc, strs, seg.maxFret).map(x => ({ s: x.s, f: x.f, cls: 'tri', label: Theory.noteName(pr.pc) })) : [];
+      host.innerHTML = Theory.drawBoard({ lo: 0, hi: seg.maxFret, notes, activeStrings: playing ? strs : seg.strs });
+      $('s-mini').innerHTML = '';
+      Board.key = key;
+      $('s-caption').textContent = playing ? `${pi + 1}/${seg.prompts.length}   ${noteFindText(pr)}${reveal ? '' : '   — find it!'}` : 'Get ready…';
+    }
+    return;
+  }
+  if (seg.kind === 'callResp') {
+    const k = phraseAt(seg, step), ph = seg.phrases[k], off = step - ph.start;
+    const region = !playing ? 'ready' : off < ph.cb ? 'listen' : off < 2 * ph.cb ? 'turn' : 'answer';
+    const key = `cr${S.i}:${k}:${region}`;
+    const lab = n => seg.labels === 'names' ? Theory.noteName(n.pc) : Theory.DEGREE[n.iv];
+    if (Board.key !== key || force) {
+      let notes;
+      if (region === 'answer') {
+        // number each note of the phrase in the order it was played
+        const order = new Map();
+        ph.notes.forEach((n, j) => order.set(n, (order.get(n) || []).concat(j + 1)));
+        notes = seg.posNotes.map(n => order.has(n)
+          ? { s: n.s, f: n.f, cls: 'tri' + (n.root ? ' rootring' : ''), label: order.get(n).join('·'), key: 'p' + seg.posNotes.indexOf(n) }
+          : { s: n.s, f: n.f, cls: 'faint' + (n.root ? ' root' : ''), label: lab(n) });
+      } else {
+        notes = seg.posNotes.map(n => ({ s: n.s, f: n.f, cls: n.root ? 'root' : '', label: lab(n) }));
+      }
+      const lo = Math.max(0, Math.min(...seg.posNotes.map(n => n.f)) - 1);
+      const hi = Math.max(lo + 5, Math.max(...seg.posNotes.map(n => n.f)) + 1);
+      host.innerHTML = Theory.drawBoard({ lo, hi, notes });
+      $('s-mini').innerHTML = '';
+      Board.key = key; Board.cur = -1;
+      const caps = { ready: 'Get ready to listen…', listen: '👂 Listen…', turn: '🎸 Your turn — play it back', answer: "Here's how it went" };
+      $('s-caption').textContent = (playing ? `${k + 1}/${seg.phrases.length}   ` : '') + caps[region];
+    }
+    if (region === 'answer') {
+      // glow on each note as the answer plays back
+      const j = off - 2 * ph.cb;
+      const n = j >= 0 && j < ph.notes.length ? ph.notes[j] : null;
+      const id = n ? 'p' + seg.posNotes.indexOf(n) : '';
+      if (Board.cur !== id) {
+        host.querySelectorAll('g.n.cur').forEach(el => el.classList.remove('cur'));
+        if (id) { const el = host.querySelector(`g.n[data-key="${id}"]`); if (el) el.classList.add('cur'); }
+        Board.cur = id;
+      }
+    }
     return;
   }
   const active = Theory.STRING_SETS[seg.set].strings;
@@ -1211,11 +1370,13 @@ function render() {
   $('session').classList.toggle('song', song);
   $('session').classList.toggle('board', board);
   const itemCount = S.routine.items.length;
-  const kindLabel = song ? 'Song' : seg.kind === 'scale' ? 'Scale' : board ? 'Triads' : 'Exercise';
+  const kindLabel = song ? 'Song' : seg.kind === 'scale' ? 'Scale' : (seg.kind === 'noteFind' || seg.kind === 'callResp') ? 'Drill' : board ? 'Triads' : 'Exercise';
   $('s-progress').textContent = `${kindLabel} · ${seg.item + 1} of ${itemCount}`;
   $('s-name').textContent = seg.name;
   const step = seg.ladder ? ` · step ${seg.ladder.k}/${seg.ladder.n}` : '';
   if (seg.kind === 'scale') $('s-sub').textContent = `Position ${seg.p}${seg.all ? ' of 5' : ''} · ${seg.bpm} BPM`;
+  else if (seg.kind === 'noteFind') $('s-sub').textContent = `Frets 0–${seg.maxFret} · ${seg.bpm} BPM`;
+  else if (seg.kind === 'callResp') $('s-sub').textContent = `${seg.title} · position ${seg.p} · ${seg.bpm} BPM`;
   else if (board) $('s-sub').textContent = `${Theory.STRING_SETS[seg.set].label} strings · ${seg.bpm} BPM`;
   else $('s-sub').textContent = song ? `${seg.section} · ${seg.pct}%${step}` : `${seg.bpm} BPM${step}`;
   if (board) showBoard(seg);
@@ -1416,13 +1577,22 @@ function defaultSongLadder() {
   return { start: 60, end: 100, step: 10, mode: 'loops', amount: 2, breakSec: 3 };
 }
 
-const isBoardItem = it => it && (it.type === 'scale' || it.type === 'triad');
+const isBoardItem = it => it && ['scale', 'triad', 'noteFind', 'callResp'].includes(it.type);
 const capFirst = t => t.charAt(0).toUpperCase() + t.slice(1);
 
 function itemName(it) {
   if (it.type === 'scale') {
     const sc = Theory.SCALES[it.scale] || Theory.SCALES.minPent;
     return `🎼 ${Theory.noteName(num(it.key, 9))} ${sc.name}`;
+  }
+  if (it.type === 'noteFind') {
+    const ks = Array.isArray(it.keys) && it.keys.length ? it.keys : NATURALS;
+    const which = ks.length === 12 ? 'all notes' : ks.length === 7 && NATURALS.every(n => ks.includes(n)) ? 'natural notes' : ks.map(Theory.noteName).join(', ');
+    return `🎯 Note finder – ${which}`;
+  }
+  if (it.type === 'callResp') {
+    const sc = Theory.SCALES[it.scale] || Theory.SCALES.minPent;
+    return `👂 Call and response – ${Theory.noteName(num(it.key, 9))} ${sc.name}, pos ${num(it.p, 1)}`;
   }
   if (it.type === 'triad') {
     const q = it.quality === 'both' ? 'major & minor' : (it.quality || 'major');
@@ -1466,6 +1636,35 @@ function boardItemFields(it, i) {
   const sel = (f, label, options) => `<label class="field"><span>${label}</span><select data-i="${i}" data-f="b.${f}">${options}</select></label>`;
   const oneToFour = cur => [1, 2, 3, 4].map(n => opt(n, cur, n)).join('');
   let h = '';
+  if (it.type === 'noteFind') {
+    const ks = Array.isArray(it.keys) && it.keys.length ? it.keys : NATURALS;
+    h += `<span class="flabel">Notes to find</span>` + keyCircle(i, ks, true).replace(/key(s)? · tap to add or remove/, m => m.replace('key', 'note'));
+    h += `<div class="row keybtns"><button class="btn small" data-act="naturals" data-i="${i}">Natural notes</button>
+      <button class="btn small" data-act="allkeys" data-i="${i}">All 12</button></div>`;
+    const st = itemStrings(it);
+    h += `<div class="field"><span class="flabel">Strings</span><div class="chips">
+      ${[5, 4, 3, 2, 1, 0].map(n => `<button class="chip${st.includes(n) ? ' on' : ''}" data-act="str" data-i="${i}" data-n="${n}">${Theory.STRING_SHORT[n]}</button>`).join('')}
+    </div></div>`;
+    h += `<div class="inline-fields">
+      ${sel('mode', 'Questions', opt('mix', it.mode, 'Mix of both') + opt('every', it.mode, '"Find every C"') + opt('string', it.mode, '"G on the A string"'))}
+      ${sel('maxFret', 'Frets', [5, 7, 12, 15].map(n => opt(n, it.maxFret, 'Up to ' + n)).join(''))}
+    </div>
+    <div class="inline-fields">${numF('bpm', 'BPM', it.bpm)}${numF('prompts', 'How many', it.prompts)}</div>
+    <div class="inline-fields">${sel('findBars', 'Bars to find it', oneToFour(it.findBars))}${sel('revealBars', 'Bars to check', oneToFour(it.revealBars))}</div>`;
+    return h + `<div class="muted sum" id="songSum${i}">${esc(itemSummary(it))}</div>`;
+  }
+  if (it.type === 'callResp') {
+    h += keyCircle(i, [Theory.pcOf(num(it.key, 9))], false);
+    const lens = (from, to, cur) => { let o = ''; for (let n = from; n <= to; n++) o += opt(n, cur, n + ' notes'); return o; };
+    h += `<div class="inline-fields">
+      ${sel('scale', 'Scale', Theory.SCALE_ORDER.map(id => opt(id, it.scale, capFirst(Theory.SCALES[id].name))).join(''))}
+      ${sel('p', 'Position', [1, 2, 3, 4, 5].map(n => opt(n, it.p, n)).join(''))}
+    </div>
+    <div class="inline-fields">${numF('bpm', 'BPM', it.bpm)}${numF('prompts', 'Phrases', it.prompts)}</div>
+    <div class="inline-fields">${sel('len', 'Start with', lens(2, 6, it.len))}${sel('maxLen', 'Grow up to', lens(3, 10, it.maxLen))}</div>
+    ${sel('labels', 'Labels', opt('degrees', it.labels, 'Degrees') + opt('names', it.labels, 'Note names'))}`;
+    return h + `<div class="muted sum" id="songSum${i}">${esc(itemSummary(it))}</div>`;
+  }
   if (it.type === 'scale') {
     h += keyCircle(i, [Theory.pcOf(num(it.key, 9))], false);
     h += sel('scale', 'Scale', Theory.SCALE_ORDER.map(id => opt(id, it.scale, capFirst(Theory.SCALES[id].name))).join(''));
@@ -1505,6 +1704,16 @@ function boardItemFields(it, i) {
 }
 
 function boardSummary(it) {
+  if (it.type === 'noteFind') {
+    const seg = noteFindSegments(it, 0, 0)[0], fb = num(it.findBars, 2);
+    const q = it.mode === 'every' ? '"Find every…"' : it.mode === 'string' ? '"…on the … string"' : 'a mix of both kinds of';
+    return `${seg.prompts.length} ${q} questions on frets 0–${seg.maxFret}. ${fb} bar${fb === 1 ? '' : 's'} to find each one, then it's shown — about ${fmtShort(seg.duration)}.`;
+  }
+  if (it.type === 'callResp') {
+    const seg = callRespSegments(it, 0, 0)[0];
+    const a = seg.phrases[0].notes.length, b = seg.phrases[seg.phrases.length - 1].notes.length;
+    return `${seg.phrases.length} phrases in ${seg.title}, position ${seg.p}, growing from ${a} to ${b} notes. Listen, play it back, then see it — about ${fmtShort(seg.duration)}.`;
+  }
   const segs = it.type === 'scale' ? scaleSegments(it, 0, 0) : triadSegments(it, 0, 0);
   const total = fmtShort(segs.reduce((t, x, k) => t + x.duration + (k ? x.breakBefore : 0), 0));
   if (it.type === 'scale') {
@@ -1652,6 +1861,7 @@ function renderRoutineEditor() {
       <button class="btn addbtn" data-act="pick" data-kind="scale">＋ Scale</button>
       <button class="btn addbtn" data-act="pick" data-kind="triad">＋ Triads</button>
       <button class="btn addbtn" data-act="pick" data-kind="song">＋ Song</button>
+      <button class="btn addbtn wide2" data-act="pick" data-kind="drill">＋ Theory drill</button>
     </div>
     <div class="row" style="margin-top:28px">
       <button class="btn primary" data-act="save" style="flex:1">Save routine</button>
@@ -1671,7 +1881,7 @@ $('view').addEventListener('change', e => {
   if (draft && el.dataset.f && el.type === 'checkbox') updateDraftField(el);
   if (draft && el.dataset.f && el.tagName === 'SELECT') {
     updateDraftField(el);
-    if (/mode$|^b\.(scale|quality)$/.test(el.dataset.f)) {   // redraw to show the converted number / new name
+    if (/mode$|^b\.(scale|quality|p|len)$/.test(el.dataset.f)) {   // redraw to show the converted number / new name
       const y = window.scrollY; renderRoutineEditor(); window.scrollTo(0, y);
     }
   }
@@ -1689,7 +1899,7 @@ function updateDraftField(el) {
       // Scale guide and triad settings
       const k = f.slice(2);
       if (el.type === 'checkbox') it[k] = el.checked;
-      else if (['bpm', 'rounds', 'posBreak', 'prompts', 'findBars', 'revealBars', 'bars'].includes(k)) it[k] = Math.max(k === 'posBreak' ? 0 : 1, num(el.value, it[k]));
+      else if (['bpm', 'rounds', 'posBreak', 'prompts', 'findBars', 'revealBars', 'bars', 'p', 'len', 'maxLen', 'maxFret'].includes(k)) it[k] = Math.max(k === 'posBreak' ? 0 : 1, num(el.value, it[k]));
       else if (k === 'positions') it[k] = el.value === 'all' ? 'all' : num(el.value, 1);
       else it[k] = el.value;
     }
@@ -1756,6 +1966,21 @@ $('view').addEventListener('click', e => {
     const y = window.scrollY; renderRoutineEditor(); window.scrollTo(0, y);
     return;
   }
+  if (act === 'naturals') {
+    draft.items[i].keys = NATURALS.slice();
+    const y = window.scrollY; renderRoutineEditor(); window.scrollTo(0, y);
+    return;
+  }
+  if (act === 'str') {
+    const it = draft.items[i], n = +b.dataset.n, v = itemStrings(it), at = v.indexOf(n);
+    if (at >= 0) {
+      if (v.length === 1) { toast('Keep at least one string'); return; }
+      v.splice(at, 1);
+    } else v.push(n);
+    it.strs = v.sort();
+    const y = window.scrollY; renderRoutineEditor(); window.scrollTo(0, y);
+    return;
+  }
   if (act === 'allkeys' || act === 'onekey') {
     const it = draft.items[i];
     it.keys = act === 'allkeys' ? Theory.CIRCLE.slice() : [itemKeys(it)[0]];
@@ -1764,7 +1989,7 @@ $('view').addEventListener('click', e => {
   }
   if (act === 'key') {
     const it = draft.items[i], pc = +b.dataset.pc;
-    if (it.type === 'scale') it.key = pc;
+    if (it.type === 'scale' || it.type === 'callResp') it.key = pc;
     else {
       const ks = itemKeys(it), at = ks.indexOf(pc);
       if (at >= 0) {
@@ -1789,6 +2014,10 @@ function addToDraft(val) {
       if (ex) draft.items.push({ exId: ex.id, name: ex.name, bpm: ex.bpm, duration: ex.duration, ladder: null });
     } else if (val === 'scale:new') {
       draft.items.push({ type: 'scale', key: 9, scale: 'minPent', bpm: 80, positions: 'all', rounds: 2, posBreak: 4, labels: 'degrees', tones: true });
+    } else if (val === 'drill:note') {
+      draft.items.push({ type: 'noteFind', keys: NATURALS.slice(), strs: [0, 1, 2, 3, 4, 5], mode: 'mix', maxFret: 12, bpm: 70, prompts: 10, findBars: 2, revealBars: 1 });
+    } else if (val === 'drill:call') {
+      draft.items.push({ type: 'callResp', key: 9, scale: 'minPent', p: 1, bpm: 70, prompts: 10, len: 3, maxLen: 6, labels: 'degrees' });
     } else if (val === 'triad:walk') {
       draft.items.push({ type: 'triad', mode: 'walk', keys: [0], quality: 'major', strings: 'gbe', bpm: 70, bars: 2, sayNames: true, shuffle: false, labels: 'degrees' });
     } else if (val === 'triad:quiz') {
@@ -1837,7 +2066,7 @@ function openPicker(kind) {
     return;
   }
   pickerKind = kind; pickerAdded = 0;
-  const titles = { exercise: 'Add an exercise', triad: 'Add triads', song: 'Add a song' };
+  const titles = { exercise: 'Add an exercise', triad: 'Add triads', song: 'Add a song', drill: 'Add a theory drill' };
   $('pk-title').textContent = titles[kind];
   const search = $('pk-search');
   search.value = '';
@@ -1859,6 +2088,9 @@ function renderPickerList() {
   } else if (pickerKind === 'triad') {
     h = `<button class="pk-row" data-add="triad:walk"><b>🔺 Walk the neck</b><span>Learn the shapes: they climb the neck in time with the click</span></button>
          <button class="pk-row" data-add="triad:quiz"><b>🔺 Name it, find it</b><span>Test yourself: the voice calls a triad, then it's shown</span></button>`;
+  } else if (pickerKind === 'drill') {
+    h = `<button class="pk-row" data-add="drill:note"><b>🎯 Note finder</b><span>"Find every C" or "G on the A string" — then the answer appears</span></button>
+         <button class="pk-row" data-add="drill:call"><b>👂 Call and response</b><span>Roadie plays a short phrase, you play it back, then it's shown</span></button>`;
   } else if (pickerKind === 'song') {
     if (!songs.length) h = '<div class="empty">No songs yet. Import one in the Songs tab first.</div>';
     for (const s of songs) {
@@ -1897,7 +2129,7 @@ $('picker').addEventListener('click', e => {
   row.classList.add('added');
   setTimeout(() => row.classList.remove('added'), 700);
   toast(`Added ✓  (${pickerAdded})`);
-  if (pickerKind === 'triad') closePicker();   // only one triad item is usually wanted
+  if (pickerKind === 'triad' || pickerKind === 'drill') closePicker();   // usually just one of these at a time
 });
 
 /* ---------- Exercise library ---------- */
@@ -2296,6 +2528,12 @@ function renderSettings() {
       <label class="field"><span>Speaking speed</span><input type="range" min="0.6" max="1.4" step="0.05" data-s="voiceRate" value="${settings.voiceRate}"></label>
       <button class="btn wide" id="testVoice">▶ Test voice</button>
     </div>
+    <h2>Theory tips</h2>
+    <div class="card">
+      ${chk('tips', 'Speak a one-sentence theory tip in the breaks between items')}
+      <p class="muted" id="tipInfo">Next tip: ${(settings.tipIdx % Theory.TIPS.length) + 1} of ${Theory.TIPS.length}. They start simple and build up.</p>
+      <div class="row"><button class="btn" id="hearTip">▶ Hear the next tip</button><button class="btn" id="resetTips">Start tips over</button></div>
+    </div>
     <h2>Session</h2>
     <div class="card">
       <label class="field"><span>Get-ready time before the first item (seconds)</span><input type="number" inputmode="numeric" data-s="firstBreak" value="${settings.firstBreak}"></label>
@@ -2307,7 +2545,7 @@ function renderSettings() {
       <button class="btn wide" id="importBtn">Import backup</button>
       <input type="file" id="importFile" accept=".json,application/json" hidden>
     </div>
-    <p class="muted" style="text-align:center;margin-top:24px">Roadie · Phase 3</p>`;
+    <p class="muted" style="text-align:center;margin-top:24px">Roadie · Phase 4A</p>`;
   fillVoiceSelect($('voiceSel'));
 
   v.querySelectorAll('[data-s]').forEach(el => {
@@ -2336,6 +2574,18 @@ function renderSettings() {
     const was = settings.voiceOn; settings.voiceOn = true;
     speak('Next up: Chromatic Spider, 80 BPM, 2 minutes.');
     settings.voiceOn = was;
+  });
+  $('hearTip').addEventListener('click', () => {
+    if (ctx && ctx.state === 'running') ctx.suspend();
+    unlockSpeech();
+    const was = settings.voiceOn; settings.voiceOn = true;
+    speak(Theory.TIPS[settings.tipIdx % Theory.TIPS.length]);
+    settings.voiceOn = was;
+  });
+  $('resetTips').addEventListener('click', () => {
+    settings.tipIdx = 0; saveSettings();
+    $('tipInfo').textContent = `Next tip: 1 of ${Theory.TIPS.length}. They start simple and build up.`;
+    toast('Tips will start from the beginning');
   });
   $('exportBtn').addEventListener('click', exportBackup);
   $('importBtn').addEventListener('click', () => $('importFile').click());
