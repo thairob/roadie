@@ -253,10 +253,12 @@ const Metro = {
   running: false, bpm: 80, nextTime: 0, beat: 0, countIn: 4, countOnly: false, timer: null,
   queue: [],              // scheduled beats for the visual flash: {time, beat, accent}
   onBeat: null,           // called when a beat is actually heard
-  start(bpm, startTime, countIn, countOnly) {
+  start(bpm, startTime, countIn, countOnly, limit) {
     this.stop();
     this.bpm = bpm; this.nextTime = startTime; this.countIn = countIn;
     this.countOnly = !!countOnly;   // songs: click the count-in only, then go quiet
+    this.limit = limit == null ? null : Math.max(0, limit);   // drills: stop after this many beats
+    this.limitReached = false; this.endTime = 0;
     this.beat = -countIn;           // negative beats = count-in
     this.running = true;
     this.schedule();
@@ -273,6 +275,11 @@ const Metro = {
     while (this.nextTime < ctx.currentTime + ahead) {
       if (this.countOnly && this.beat >= 0) {
         this.running = false; clearInterval(this.timer); this.timer = null;
+        return;
+      }
+      if (this.limit != null && this.beat >= this.limit) {
+        this.running = false; clearInterval(this.timer); this.timer = null;
+        this.limitReached = true; this.endTime = this.nextTime;   // when the last beat has finished
         return;
       }
       const accent = this.beat < 0 ? this.beat === -this.countIn : (this.beat % bpb === 0);
@@ -402,24 +409,46 @@ function speak(text, onDone) {
     if (token === speechToken && onDone) { const f = onDone; onDone = null; f(); }
   };
   if (!settings.voiceOn || !text || !('speechSynthesis' in window)) { setTimeout(finish, 0); return; }
-  if (speechSynthesis.speaking || speechSynthesis.pending) speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
-  const v = pickVoice();
-  if (v) { u.voice = v; u.lang = v.lang; } else { u.lang = 'en-US'; }
-  u.rate = settings.voiceRate;
-  u.onend = finish; u.onerror = finish;
   speaking = true;
   setTimeout(() => { if (token === speechToken) speaking = false; }, 15000);  // safety net
-  speechSynthesis.speak(u);
+  let started = false, tries = 0;
+  const go = () => {
+    if (token !== speechToken) return;
+    const u = new SpeechSynthesisUtterance(text);
+    const v = pickVoice();
+    if (v) { u.voice = v; u.lang = v.lang; } else { u.lang = 'en-US'; }
+    u.rate = settings.voiceRate;
+    u.onstart = () => { started = true; };
+    u.onend = finish;
+    u.onerror = e => { if (!started && tries < 2 && e && e.error !== 'interrupted' && e.error !== 'canceled') setTimeout(go, 200); else finish(); };
+    tries++;
+    speechSynthesis.speak(u);
+    // iPhone sometimes silently drops a cue: if it hasn't started shortly, try once more
+    setTimeout(() => {
+      if (token === speechToken && !started && !speechSynthesis.speaking && tries < 2) {
+        speechSynthesis.cancel();
+        setTimeout(go, 150);
+      }
+    }, 900);
+  };
+  if (speechSynthesis.speaking || speechSynthesis.pending) {
+    // iPhone can ignore a cue that starts right after a cancel, so leave a short gap
+    speechSynthesis.cancel();
+    setTimeout(go, 150);
+  } else {
+    go();
+  }
 }
 function stopSpeech() {
   speechToken++;
   speaking = false;
   if ('speechSynthesis' in window && (speechSynthesis.speaking || speechSynthesis.pending)) speechSynthesis.cancel();
 }
+let speechUnlocked = false;
 function unlockSpeech() {
-  // iOS needs the first utterance to come from a tap
-  if (!('speechSynthesis' in window)) return;
+  // iOS needs the first utterance to come from a tap — once is enough
+  if (!('speechSynthesis' in window) || speechUnlocked) return;
+  speechUnlocked = true;
   const u = new SpeechSynthesisUtterance(' ');
   u.volume = 0;
   speechSynthesis.speak(u);
@@ -482,6 +511,25 @@ function itemStrings(it) {
   return v.length ? v.sort() : [0, 1, 2, 3, 4, 5];
 }
 
+// Quiz timing: seconds (default for new items) or bars. Either way it's rounded to whole beats
+// so the questions stay in time with the click.
+function quizTiming(item, bpm) {
+  const bpb = settings.beatsPerBar;
+  let findBeats, showBeats;
+  if (item.timing === 'secs') {
+    findBeats = Math.max(1, Math.round(clamp(num(item.findSecs, 5), 1, 60) * bpm / 60));
+    showBeats = Math.max(1, Math.round(clamp(num(item.revealSecs, 3), 1, 60) * bpm / 60));
+  } else {
+    findBeats = clamp(Math.round(num(item.findBars, 2)), 1, 8) * bpb;
+    showBeats = clamp(Math.round(num(item.revealBars, 1)), 1, 8) * bpb;
+  }
+  return { findBeats, cycle: findBeats + showBeats };
+}
+function quizTimingText(item) {
+  if (item.timing === 'secs') { const f = clamp(num(item.findSecs, 5), 1, 60); return `${f} second${f === 1 ? '' : 's'}`; }
+  const fb = num(item.findBars, 2); return `${fb} bar${fb === 1 ? '' : 's'}`;
+}
+
 function noteFindSegments(item, idx, brk) {
   const bpm = clamp(Math.round(num(item.bpm, 70)), 20, 300);
   const bpb = settings.beatsPerBar;
@@ -489,8 +537,7 @@ function noteFindSegments(item, idx, brk) {
   const strs = itemStrings(item);
   const maxFret = clamp(Math.round(num(item.maxFret, 12)), 3, 17);
   const n = clamp(Math.round(num(item.prompts, 10)), 1, 100);
-  const findB = clamp(Math.round(num(item.findBars, 2)), 1, 8), showB = clamp(Math.round(num(item.revealBars, 1)), 1, 8);
-  const cycle = (findB + showB) * bpb;
+  const { findBeats, cycle } = quizTiming(item, bpm);
   const mode = item.mode === 'every' || item.mode === 'string' ? item.mode : 'mix';
   const prompts = [];
   let last = '';
@@ -508,8 +555,8 @@ function noteFindSegments(item, idx, brk) {
   }
   const dur = n * cycle * 60 / bpm;
   return [{
-    kind: 'noteFind', item: idx, name: 'Note finder', bpm, prompts, cycle, findBeats: findB * bpb, strs, maxFret,
-    duration: dur, durText: `${n} notes`, ladder: null, tip: '', breakBefore: brk
+    kind: 'noteFind', item: idx, name: 'Note finder', bpm, prompts, cycle, findBeats, strs, maxFret,
+    totalSteps: n * cycle, duration: dur, durText: `${n} notes`, ladder: null, tip: '', breakBefore: brk
   }];
 }
 
@@ -536,7 +583,7 @@ function callRespSegments(item, idx, brk) {
     title: `${Theory.noteName(key)} ${Theory.SCALES[scale].name}`,
     spokenTitle: `${Theory.spokenNote(key)} ${Theory.SCALES[scale].name}`,
     labels: item.labels === 'names' ? 'names' : 'degrees',
-    duration: dur, durText: `${n} phrases`, ladder: null, tip: '', breakBefore: brk
+    totalSteps: beat, duration: dur, durText: `${n} phrases`, ladder: null, tip: '', breakBefore: brk
   }];
 }
 function phraseAt(seg, step) {
@@ -578,7 +625,7 @@ function scaleSegments(item, idx, brk) {
       name: `${Theory.noteName(key)} ${Theory.SCALES[scale].name}`,
       spokenName: `${Theory.spokenNote(key)} ${Theory.SCALES[scale].name}`,
       pos, path, tones: item.tones !== false, labels: item.labels === 'names' ? 'names' : 'degrees',
-      duration: dur, durText: fmtSpoken(dur), ladder: null, tip: '',
+      totalSteps: path.length, duration: dur, durText: fmtSpoken(dur), ladder: null, tip: '',
       breakBefore: k === 0 ? brk : num(item.posBreak, 4)
     };
   });
@@ -593,8 +640,7 @@ function triadSegments(item, idx, brk) {
   const quals = itemQualities(item);
   if (item.mode === 'quiz') {
     const n = clamp(Math.round(num(item.prompts, 10)), 1, 100);
-    const findB = clamp(Math.round(num(item.findBars, 2)), 1, 8), showB = clamp(Math.round(num(item.revealBars, 1)), 1, 8);
-    const cycle = (findB + showB) * bpb;
+    const { findBeats, cycle } = quizTiming(item, bpm);
     const prompts = [];
     let last = '';
     for (let k = 0; k < n; k++) {
@@ -609,8 +655,8 @@ function triadSegments(item, idx, brk) {
     }
     const dur = n * cycle * 60 / bpm;
     return [{
-      kind: 'triadQuiz', item: idx, name: 'Triad quiz', set, bpm, prompts, cycle, findBeats: findB * bpb, labels,
-      duration: dur, durText: `${n} triads`, ladder: null, tip: '', breakBefore: brk
+      kind: 'triadQuiz', item: idx, name: 'Triad quiz', set, bpm, prompts, cycle, findBeats, labels,
+      totalSteps: n * cycle, duration: dur, durText: `${n} triads`, ladder: null, tip: '', breakBefore: brk
     }];
   }
   if (item.shuffle) keys = shuffleList(keys);
@@ -624,7 +670,7 @@ function triadSegments(item, idx, brk) {
     return {
       kind: 'triadWalk', item: idx, name: `${Theory.noteName(c.k)} ${c.q} triads`, key: c.k, quality: c.q, set, bpm, shapes, bps,
       sayNames: item.sayNames !== false, labels, comboIdx: j,
-      duration: dur, durText: fmtSpoken(dur), ladder: null, tip: '', breakBefore: j === 0 ? brk : 4
+      totalSteps: shapes.length * bps, duration: dur, durText: fmtSpoken(dur), ladder: null, tip: '', breakBefore: j === 0 ? brk : 4
     };
   });
 }
@@ -877,7 +923,7 @@ function enterCountIn(remaining, songState) {
   S.countBpm = bpm;
   S.countStart = now() + 0.15;
   S.playStart = S.countStart + 4 * 60 / bpm;
-  Metro.start(bpm, ctx.currentTime + 0.15, 4, isSongSeg(seg));
+  Metro.start(bpm, ctx.currentTime + 0.15, 4, isSongSeg(seg), isBoardSeg(seg) ? seg.totalSteps - S.stepBase : null);
   render();
 }
 
@@ -939,6 +985,7 @@ function endSegment() {
 function currentRemaining() {
   const seg = curSeg();
   if (!seg) return 0;
+  if (S.phase === 'play' && isBoardSeg(seg)) return Math.max(0, seg.totalSteps - (S.boardStep || 0)) * 60 / seg.bpm;
   if (S.phase === 'play') return S.segRemaining - (now() - S.playStart);
   if (S.phase === 'countin') return S.segRemaining;
   if (S.phase === 'paused' && S.pausedFrom) return S.pausedFrom.rem;
@@ -969,7 +1016,7 @@ function tick() {
     // Wait for both the break timer and the voice cue, so we never talk over the count-in
     // Backups in case iPhone never reports that the voice finished
     const speechSilent = 'speechSynthesis' in window && !speechSynthesis.speaking && !speechSynthesis.pending
-                         && t > S.speechStartedAt + 1.5;
+                         && t > S.speechStartedAt + 2.6;
     const speechTimeout = t > S.breakEnd + 8;
     if (t >= S.breakEnd && (S.speechDone || speechSilent || speechTimeout)) {
       // Give the click sound a moment to come back after the voice before counting in
@@ -1030,6 +1077,12 @@ function tick() {
           sessionSeek(seg.start);
         }
       }
+    } else if (isBoardSeg(seg)) {
+      // Beat-driven drills end when their last beat has played. iPhone pauses the click
+      // while the voice talks, so a clock would run out before the drill is finished.
+      const done = Metro.limitReached && ctx && ctx.currentTime >= Metro.endTime - 0.02 && !Metro.queue.length;
+      const stuck = t - S.playStart > (seg.totalSteps - S.stepBase) * 60 / seg.bpm + 20;   // safety net
+      if (done || stuck) { endSegment(); return; }
     } else if (currentRemaining() <= 0) {
       endSegment();
       return;
@@ -1629,6 +1682,16 @@ function keyCircle(i, selected, multi) {
   return h + '</div>';
 }
 
+function quizTimingFields(it, i, sel, numF, opt, oneToFour) {
+  const secs = it.timing === 'secs';
+  return `<div class="inline-fields">
+      ${sel('timing', 'Measure in', opt('secs', secs ? 'secs' : 'bars', 'Seconds') + opt('bars', secs ? 'secs' : 'bars', 'Bars'))}
+    </div>
+    <div class="inline-fields">${secs
+      ? numF('findSecs', 'Seconds to find it', num(it.findSecs, 5)) + numF('revealSecs', 'Seconds to check', num(it.revealSecs, 3))
+      : sel('findBars', 'Bars to find it', oneToFour(it.findBars)) + sel('revealBars', 'Bars to check', oneToFour(it.revealBars))}</div>`;
+}
+
 function boardItemFields(it, i) {
   const opt = (v, cur, label) => `<option value="${v}" ${String(cur) === String(v) ? 'selected' : ''}>${label}</option>`;
   const chk = (f, on, label) => `<label class="toggle compact"><span>${label}</span><input type="checkbox" data-i="${i}" data-f="b.${f}" ${on ? 'checked' : ''}></label>`;
@@ -1650,7 +1713,7 @@ function boardItemFields(it, i) {
       ${sel('maxFret', 'Frets', [5, 7, 12, 15].map(n => opt(n, it.maxFret, 'Up to ' + n)).join(''))}
     </div>
     <div class="inline-fields">${numF('bpm', 'BPM', it.bpm)}${numF('prompts', 'How many', it.prompts)}</div>
-    <div class="inline-fields">${sel('findBars', 'Bars to find it', oneToFour(it.findBars))}${sel('revealBars', 'Bars to check', oneToFour(it.revealBars))}</div>`;
+    ${quizTimingFields(it, i, sel, numF, opt, oneToFour)}`;
     return h + `<div class="muted sum" id="songSum${i}">${esc(itemSummary(it))}</div>`;
   }
   if (it.type === 'callResp') {
@@ -1692,7 +1755,7 @@ function boardItemFields(it, i) {
     </div>`;
     if (it.mode === 'quiz') {
       h += `<div class="inline-fields">${numF('bpm', 'BPM', it.bpm)}${numF('prompts', 'How many', it.prompts)}</div>
-      <div class="inline-fields">${sel('findBars', 'Bars to find it', oneToFour(it.findBars))}${sel('revealBars', 'Bars to check', oneToFour(it.revealBars))}</div>`;
+      ${quizTimingFields(it, i, sel, numF, opt, oneToFour)}`;
     } else {
       h += `<div class="inline-fields">${numF('bpm', 'BPM', it.bpm)}${sel('bars', 'Bars per shape', oneToFour(it.bars))}</div>
       ${chk('sayNames', it.sayNames !== false, 'Voice names the next shape')}
@@ -1705,9 +1768,9 @@ function boardItemFields(it, i) {
 
 function boardSummary(it) {
   if (it.type === 'noteFind') {
-    const seg = noteFindSegments(it, 0, 0)[0], fb = num(it.findBars, 2);
+    const seg = noteFindSegments(it, 0, 0)[0];
     const q = it.mode === 'every' ? '"Find every…"' : it.mode === 'string' ? '"…on the … string"' : 'a mix of both kinds of';
-    return `${seg.prompts.length} ${q} questions on frets 0–${seg.maxFret}. ${fb} bar${fb === 1 ? '' : 's'} to find each one, then it's shown — about ${fmtShort(seg.duration)}.`;
+    return `${seg.prompts.length} ${q} questions on frets 0–${seg.maxFret}. ${quizTimingText(it)} to find each one, then it's shown — about ${fmtShort(seg.duration)}.`;
   }
   if (it.type === 'callResp') {
     const seg = callRespSegments(it, 0, 0)[0];
@@ -1724,8 +1787,7 @@ function boardSummary(it) {
   const q = it.quality === 'both' ? 'major and minor' : (it.quality || 'major');
   const only = invsText(it) ? ` (${invsText(it)} only)` : '';
   if (it.mode === 'quiz') {
-    const fb = num(it.findBars, 2);
-    return `${num(it.prompts, 10)} random ${q} triads${only} in ${keys}. ${fb} bar${fb === 1 ? '' : 's'} to find each one, then it's shown — about ${total}.`;
+    return `${num(it.prompts, 10)} random ${q} triads${only} in ${keys}. ${quizTimingText(it)} to find each one, then it's shown — about ${total}.`;
   }
   const bars = num(it.bars, 2);
   const n = segs.length ? segs[0].shapes.length : 7;
@@ -1881,7 +1943,7 @@ $('view').addEventListener('change', e => {
   if (draft && el.dataset.f && el.type === 'checkbox') updateDraftField(el);
   if (draft && el.dataset.f && el.tagName === 'SELECT') {
     updateDraftField(el);
-    if (/mode$|^b\.(scale|quality|p|len)$/.test(el.dataset.f)) {   // redraw to show the converted number / new name
+    if (/mode$|^b\.(scale|quality|p|len|timing)$/.test(el.dataset.f)) {   // redraw to show the converted number / new name
       const y = window.scrollY; renderRoutineEditor(); window.scrollTo(0, y);
     }
   }
@@ -1898,8 +1960,9 @@ function updateDraftField(el) {
     if (f.startsWith('b.')) {
       // Scale guide and triad settings
       const k = f.slice(2);
+      // Seconds and bars each keep their own numbers, so switching back and forth loses nothing
       if (el.type === 'checkbox') it[k] = el.checked;
-      else if (['bpm', 'rounds', 'posBreak', 'prompts', 'findBars', 'revealBars', 'bars', 'p', 'len', 'maxLen', 'maxFret'].includes(k)) it[k] = Math.max(k === 'posBreak' ? 0 : 1, num(el.value, it[k]));
+      else if (['bpm', 'rounds', 'posBreak', 'prompts', 'findBars', 'revealBars', 'bars', 'p', 'len', 'maxLen', 'maxFret', 'findSecs', 'revealSecs'].includes(k)) it[k] = Math.max(k === 'posBreak' ? 0 : 1, num(el.value, it[k]));
       else if (k === 'positions') it[k] = el.value === 'all' ? 'all' : num(el.value, 1);
       else it[k] = el.value;
     }
@@ -2015,13 +2078,13 @@ function addToDraft(val) {
     } else if (val === 'scale:new') {
       draft.items.push({ type: 'scale', key: 9, scale: 'minPent', bpm: 80, positions: 'all', rounds: 2, posBreak: 4, labels: 'degrees', tones: true });
     } else if (val === 'drill:note') {
-      draft.items.push({ type: 'noteFind', keys: NATURALS.slice(), strs: [0, 1, 2, 3, 4, 5], mode: 'mix', maxFret: 12, bpm: 70, prompts: 10, findBars: 2, revealBars: 1 });
+      draft.items.push({ type: 'noteFind', keys: NATURALS.slice(), strs: [0, 1, 2, 3, 4, 5], mode: 'mix', maxFret: 12, bpm: 70, prompts: 10, timing: 'secs', findSecs: 5, revealSecs: 3, findBars: 2, revealBars: 1 });
     } else if (val === 'drill:call') {
       draft.items.push({ type: 'callResp', key: 9, scale: 'minPent', p: 1, bpm: 70, prompts: 10, len: 3, maxLen: 6, labels: 'degrees' });
     } else if (val === 'triad:walk') {
       draft.items.push({ type: 'triad', mode: 'walk', keys: [0], quality: 'major', strings: 'gbe', bpm: 70, bars: 2, sayNames: true, shuffle: false, labels: 'degrees' });
     } else if (val === 'triad:quiz') {
-      draft.items.push({ type: 'triad', mode: 'quiz', keys: [0, 7, 9, 4], quality: 'both', strings: 'gbe', bpm: 70, prompts: 10, findBars: 2, revealBars: 1, labels: 'degrees' });
+      draft.items.push({ type: 'triad', mode: 'quiz', keys: [0, 7, 9, 4], quality: 'both', strings: 'gbe', bpm: 70, prompts: 10, timing: 'secs', findSecs: 5, revealSecs: 3, findBars: 2, revealBars: 1, labels: 'degrees' });
     } else if (val.startsWith('song:')) {
       const [, songId, sectionId] = val.split(':');
       const song = findSong(songId), sec = findSection(song, sectionId);

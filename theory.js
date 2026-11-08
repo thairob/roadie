@@ -186,8 +186,16 @@ const Theory = (() => {
     }
     // strings
     for (let s = 0; s < 6; s++) {
-      const active = !opts.activeStrings || opts.activeStrings.includes(s);
-      svg += `<line x1="0" y1="${y(s)}" x2="${W}" y2="${y(s)}" class="fb-string${active ? '' : ' off'}" stroke-width="${1.6 + (5 - s) * 0.7}"/>`;
+      const chosen = opts.activeStrings && opts.activeStrings.includes(s);
+      const active = !opts.activeStrings || chosen;
+      const w = 1.6 + (5 - s) * 0.7;
+      if (chosen && opts.activeStrings.length < 6) {
+        // the strings you're working on: a soft amber glow under a brighter, thicker string
+        svg += `<line x1="0" y1="${y(s)}" x2="${W}" y2="${y(s)}" class="fb-glow" stroke-width="${w + 14}"/>`;
+        svg += `<line x1="0" y1="${y(s)}" x2="${W}" y2="${y(s)}" class="fb-string on" stroke-width="${w + 2.5}"/>`;
+      } else {
+        svg += `<line x1="0" y1="${y(s)}" x2="${W}" y2="${y(s)}" class="fb-string${active ? '' : ' off'}" stroke-width="${w}"/>`;
+      }
     }
     // fret numbers
     for (let f = lo; f <= hi; f++) {

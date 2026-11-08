@@ -235,7 +235,9 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .fb-fret { stroke: #6b6f78; stroke-width: 3; }
 .fb-nut { stroke: #e8e2d4; stroke-width: 9; }
 .fb-string { stroke: #b9bcc4; }
-.fb-string.off { stroke: #4a4c52; }
+.fb-string.off { stroke: #34363b; }
+.fb-string.on { stroke: #ffe3a8; }
+.fb-glow { stroke: #ffb020; opacity: 0.28; filter: blur(3px); }
 .fb-inlay { fill: #3a342c; }
 .fb-num { fill: #8f95a1; font-size: 24px; font-weight: 700; text-anchor: middle; font-family: -apple-system, sans-serif; }
 .n circle { fill: #2f3644; stroke: #8b95a8; stroke-width: 2.5; }
