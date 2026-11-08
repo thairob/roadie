@@ -387,7 +387,66 @@ const Theory = (() => {
     return chords.map((c, k) => k === 0 ? first : pick(c, anchor));
   }
 
+  /* ---------- Chords for chord-change prompts ---------- */
+  // A chord id is "root:type", e.g. "2:min" = Dm. Types: major, minor, power (5), dominant 7, minor 7.
+  const CHORD_TYPES = {
+    maj: { suffix: '', label: 'Major', tones: [0, 4, 7] },
+    min: { suffix: 'm', label: 'Minor', tones: [0, 3, 7] },
+    '5': { suffix: '5', label: 'Power (5)', tones: [0, 7] },
+    '7': { suffix: '7', label: '7th', tones: [0, 4, 7, 10] },
+    m7: { suffix: 'm7', label: 'Minor 7th', tones: [0, 3, 7, 10] }
+  };
+  const CHORD_TYPE_ORDER = ['maj', 'min', '5', '7', 'm7'];
+  const parseChord = id => { const [r, t] = String(id).split(':'); return { root: pcOf(+r || 0), type: CHORD_TYPES[t] ? t : 'maj' }; };
+  const chordName = id => { const c = parseChord(id); return noteName(c.root) + CHORD_TYPES[c.type].suffix; };
+  const chordId = (root, type) => `${pcOf(root)}:${type}`;
+
+  // Open-position shapes, low E → high E (-1 = don't play that string)
+  const OPEN_SHAPES = {
+    C: [-1, 3, 2, 0, 1, 0], D: [-1, -1, 0, 2, 3, 2], Dm: [-1, -1, 0, 2, 3, 1], E: [0, 2, 2, 1, 0, 0], Em: [0, 2, 2, 0, 0, 0],
+    G: [3, 2, 0, 0, 0, 3], A: [-1, 0, 2, 2, 2, 0], Am: [-1, 0, 2, 2, 1, 0], F: [1, 3, 3, 2, 1, 1],
+    A7: [-1, 0, 2, 0, 2, 0], B7: [-1, 2, 1, 2, 0, 2], C7: [-1, 3, 2, 3, 1, 0], D7: [-1, -1, 0, 2, 1, 2], E7: [0, 2, 0, 1, 0, 0],
+    G7: [3, 2, 0, 0, 0, 1], Am7: [-1, 0, 2, 0, 1, 0], Dm7: [-1, -1, 0, 2, 1, 1], Em7: [0, 2, 0, 0, 0, 0]
+  };
+  // Movable barre shapes, as frets above the barre (root on low E = "E shape", on A = "A shape")
+  const E_SHAPE = { maj: [0, 2, 2, 1, 0, 0], min: [0, 2, 2, 0, 0, 0], '7': [0, 2, 0, 1, 0, 0], m7: [0, 2, 0, 0, 0, 0] };
+  const A_SHAPE = { maj: [-1, 0, 2, 2, 2, 0], min: [-1, 0, 2, 2, 1, 0], '7': [-1, 0, 2, 0, 2, 0], m7: [-1, 0, 2, 0, 1, 0] };
+
+  const CHORD_POOLS = {
+    open:   { label: 'Open chords (C, D, Dm, E, Em, G, A, Am, F)', ids: ['0:maj', '2:maj', '2:min', '4:maj', '4:min', '7:maj', '9:maj', '9:min', '5:maj'] },
+    open7:  { label: 'Open 7th chords (A7, B7, C7, D7, E7, G7, Am7, Dm7, Em7)', ids: ['9:7', '11:7', '0:7', '2:7', '4:7', '7:7', '9:m7', '2:m7', '4:m7'] },
+    power:  { label: 'Power chords in any key', ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(r => r + ':5') },
+    list:   { label: 'Only the chords in my list', ids: null }
+  };
+
+  function frets2notes(frets, rootPc) {
+    const notes = [];
+    frets.forEach((f, s) => { if (f >= 0) { const midi = OPEN[s] + f; notes.push({ s, f, midi, iv: pcOf(midi - rootPc) }); } });
+    return notes;
+  }
+  // The shape to show for a chord: its open shape if it has one, otherwise a barre chord near the last one
+  function chordShape(id, prevFret) {
+    const c = parseChord(id), name = chordName(id);
+    let notes;
+    if (c.type === '5') {
+      notes = powerChord(c.root, prevFret).notes;
+    } else if (OPEN_SHAPES[name]) {
+      notes = frets2notes(OPEN_SHAPES[name], c.root);
+    } else {
+      let e = pcOf(c.root - OPEN[0]), a = pcOf(c.root - OPEN[1]);
+      if (e === 0) e = 12; if (a === 0) a = 12;
+      const target = prevFret == null ? 5 : prevFret;
+      const useE = Math.abs(e - target) <= Math.abs(a - target);
+      const base = useE ? E_SHAPE[c.type] : A_SHAPE[c.type], at = useE ? e : a;
+      notes = frets2notes(base.map(f => f < 0 ? -1 : f + at), c.root);
+    }
+    const fr = notes.map(n => n.f).filter(f => f > 0);
+    return { id, name, notes, minF: fr.length ? Math.min(...fr) : 0, maxF: fr.length ? Math.max(...fr) : 0 };
+  }
+  const chordLabel = iv => ({ 0: 'R', 3: '♭3', 4: '3', 7: '5', 10: '♭7' }[iv] || '');
+
   return {
+    CHORD_TYPES, CHORD_TYPE_ORDER, CHORD_POOLS, parseChord, chordName, chordId, chordShape, chordLabel,
     PROGRESSIONS, PROG_ORDER, progChords, progChordList, powerChord, triadPath,
     STRING_NAMES, STRING_SHORT, notePlaces, makePhrases, TIPS,
     OPEN, MAX_FRET, TRIAD_MAX, NOTE_NAMES, CIRCLE, DEGREE, SCALES, SCALE_ORDER, STRING_SETS, INV_NAMES, INV_SHORT,

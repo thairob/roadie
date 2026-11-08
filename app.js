@@ -56,9 +56,12 @@ const BUILTIN_EXERCISES = [
   { id: 'b-spider', name: 'Chromatic Spider', bpm: 80, duration: 120, tip: 'One finger per fret. Keep your fingers hovering close to the strings.' },
   { id: 'b-single', name: 'Single-String Picking', bpm: 90, duration: 120, tip: 'Strict alternate picking. Keep the motion small and from the wrist.' },
   { id: 'b-skip', name: 'String Skipping', bpm: 70, duration: 120, tip: 'Keep the pick close to the strings and mute the ones you skip.' },
-  { id: 'b-chords', name: 'Chord Changes', bpm: 60, duration: 120, tip: 'Change on beat one. Look ahead to the next shape before you need it.' },
-  { id: 'b-power', name: 'Power Chords', bpm: 90, duration: 120, tip: 'Lock the shape and slide it. Mute the strings you are not playing.' },
-  { id: 'b-chug', name: 'Palm-Muted Chugging', bpm: 100, duration: 120, tip: 'Rest the edge of your picking hand right where the strings meet the bridge.' },
+  { id: 'b-chords', name: 'Chord Changes', bpm: 60, duration: 120, tip: 'Change on beat one. Look ahead to the next shape before you need it.',
+    chords: { mode: 'list', list: ['7:maj', '0:maj', '2:maj', '4:min'], pool: 'open', every: 2 } },
+  { id: 'b-power', name: 'Power Chords', bpm: 90, duration: 120, tip: 'Lock the shape and slide it. Mute the strings you are not playing.',
+    chords: { mode: 'random', list: [], pool: 'power', every: 1 } },
+  { id: 'b-chug', name: 'Palm-Muted Chugging', bpm: 100, duration: 120, tip: 'Rest the edge of your picking hand right where the strings meet the bridge.',
+    chords: { mode: 'random', list: [], pool: 'power', every: 2 } },
   { id: 'b-penta', name: 'Minor Pentatonic Box 1', bpm: 80, duration: 120, tip: 'Up and down the box, one note per click. Clean before fast.' }
 ];
 
@@ -112,8 +115,16 @@ let settings = Object.assign({}, DEFAULT_SETTINGS, LS.get('settings', {}));
 let exercises = LS.get('exercises', null);
 let routines = LS.get('routines', null);
 let songs = LS.get('songs', []);
-if (!exercises) { exercises = BUILTIN_EXERCISES.map(e => Object.assign({}, e)); LS.set('exercises', exercises); }
+if (!exercises) { exercises = BUILTIN_EXERCISES.map(e => JSON.parse(JSON.stringify(e))); LS.set('exercises', exercises); LS.set('chordsAdded', true); }
 if (!routines) { routines = starterRoutines(); LS.set('routines', routines); }
+// One-time: give the built-in chord drills their chord prompts on phones set up before they existed
+if (!LS.get('chordsAdded', false)) {
+  exercises.forEach(e => {
+    const b = BUILTIN_EXERCISES.find(x => x.id === e.id);
+    if (b && b.chords && !e.chords) e.chords = JSON.parse(JSON.stringify(b.chords));
+  });
+  LS.set('exercises', exercises); LS.set('chordsAdded', true);
+}
 
 const saveSettings = () => LS.set('settings', settings);
 const saveExercises = () => LS.set('exercises', exercises);
@@ -601,7 +612,71 @@ function progSegments(item, idx, brk) {
   }
   return [seg];
 }
-const isBoardSeg = seg => !!seg && BOARD_KINDS.includes(seg.kind);
+const isBoardSeg = seg => !!seg && (BOARD_KINDS.includes(seg.kind) || !!seg.chordSeq);
+
+/* ---------- Chord prompts for exercises ---------- */
+// cfg: { mode: 'off' | 'list' | 'random', list: [chord ids], pool: 'open' | 'open7' | 'power' | 'list', every: bars }
+function chordCfgFor(item, ex) {
+  if (item && item.chords) return item.chords;              // this routine's own setting
+  return ex && ex.chords ? ex.chords : null;                // the exercise's default
+}
+function chordCfgActive(cfg) {
+  if (!cfg || cfg.mode === 'off') return false;
+  if (cfg.mode === 'list') return Array.isArray(cfg.list) && cfg.list.length > 0;
+  if (cfg.pool === 'list') return Array.isArray(cfg.list) && cfg.list.length > 0;
+  return !!Theory.CHORD_POOLS[cfg.pool];
+}
+function chordCfgText(cfg) {
+  if (!chordCfgActive(cfg)) return 'Off — just the metronome';
+  const every = clamp(Math.round(num(cfg.every, 2)), 1, 8);
+  const per = `${every} bar${every === 1 ? '' : 's'} each`;
+  if (cfg.mode === 'list') return `${cfg.list.map(Theory.chordName).join(' → ')}, ${per}`;
+  if (cfg.pool === 'list') return `Random from ${cfg.list.map(Theory.chordName).join(', ')}, ${per}`;
+  const names = { open: 'open chords', open7: 'open 7th chords', power: 'power chords' };
+  return `Random ${names[cfg.pool]}, ${per}`;
+}
+// Turn an exercise segment into a chord-change drill
+function spokenChordName(id) {
+  const c = Theory.parseChord(id);
+  const t = { maj: '', min: ' minor', '5': ' five', '7': ' seven', m7: ' minor seven' }[c.type];
+  return Theory.spokenNote(c.root) + t;
+}
+function spokenChordPlan(seg) {
+  const cfg = seg.chordCfg;
+  if (cfg.mode === 'list') {
+    const names = [...new Set(cfg.list)].map(spokenChordName);
+    return `Change between ${names.length > 1 ? names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1] : names[0]}.`;
+  }
+  const what = { open: 'open chords', open7: 'open seventh chords', power: 'power chords', list: 'your chords' }[cfg.pool];
+  return `With random ${what}.`;
+}
+function attachChords(seg, cfg) {
+  if (!chordCfgActive(cfg)) return seg;
+  const bpb = settings.beatsPerBar;
+  const every = clamp(Math.round(num(cfg.every, 2)), 1, 8);
+  seg.chordCfg = cfg;
+  seg.chordBeats = every * bpb;
+  seg.totalSteps = Math.max(seg.chordBeats, Math.round(seg.duration * seg.bpm / 60 / bpb) * bpb);
+  seg.duration = seg.totalSteps * 60 / seg.bpm;
+  const n = Math.ceil(seg.totalSteps / seg.chordBeats);
+  const ids = [];
+  if (cfg.mode === 'list') {
+    for (let k = 0; k < n; k++) ids.push(cfg.list[k % cfg.list.length]);
+  } else {
+    const pool = cfg.pool === 'list' ? cfg.list : Theory.CHORD_POOLS[cfg.pool].ids;
+    for (let k = 0; k < n; k++) {
+      let id, tries = 0;
+      do { id = pool[Math.floor(Math.random() * pool.length)]; tries++; } while (pool.length > 1 && id === ids[k - 1] && tries < 20);
+      ids.push(id);
+    }
+  }
+  let prev = null;
+  seg.chordSeq = ids.map(id => { const sh = Theory.chordShape(id, prev); prev = sh.minF || prev; return sh; });
+  const all = seg.chordSeq.flatMap(sh => sh.notes.map(x => x.f));
+  seg.chordLo = Math.max(0, Math.min(...all) - 1);
+  seg.chordHi = Math.max(seg.chordLo + 5, Math.max(...all) + 1);
+  return seg;
+}
 const NATURALS = [0, 2, 4, 5, 7, 9, 11];
 function itemStrings(it) {
   const v = Array.isArray(it.strs) ? it.strs.filter(n => n >= 0 && n <= 5) : [];
@@ -833,16 +908,16 @@ function buildSegments(routine) {
         const amt = Math.max(1, num(l.amount, 30));
         const dur = l.mode === 'bars' ? barsToSec(amt, bpm) : amt;
         const durText = l.mode === 'bars' ? amt + (amt === 1 ? ' bar' : ' bars') : fmtSpoken(amt);
-        segs.push({
+        segs.push(attachChords({
           kind: 'exercise', item: idx, name, tip, bpm, duration: dur, durText,
           ladder: { k: k + 1, n: steps.length, start: steps[0], end: steps[steps.length - 1] },
           breakBefore: k === 0 ? brk : num(l.breakSec, 3)
-        });
+        }, chordCfgFor(item, ex)));
       });
     } else {
       const bpm = clamp(Math.round(num(item.bpm, 80)), 20, 400);
       const dur = Math.max(5, num(item.duration, 60));
-      segs.push({ kind: 'exercise', item: idx, name, tip, bpm, duration: dur, durText: fmtSpoken(dur), ladder: null, breakBefore: brk });
+      segs.push(attachChords({ kind: 'exercise', item: idx, name, tip, bpm, duration: dur, durText: fmtSpoken(dur), ladder: null, breakBefore: brk }, chordCfgFor(item, ex)));
     }
   });
   if (segs.length) segs[0].breakBefore = num(settings.firstBreak, 5);
@@ -855,7 +930,7 @@ function routineTotalSec(routine) {
 }
 
 function announcement(seg) {
-  if (isBoardSeg(seg)) return boardAnnouncement(seg);
+  if (isBoardSeg(seg) && seg.kind !== 'exercise') return boardAnnouncement(seg);
   const parts = [];
   const speed = seg.kind === 'song' ? `${seg.pct} percent` : `${seg.bpm} BPM`;
   const label = seg.kind === 'song' ? seg.section : seg.name;
@@ -873,6 +948,7 @@ function announcement(seg) {
       parts.push(`Next up: ${title}, ${speed}, ${seg.durText}.`);
     }
   }
+  if (seg.chordSeq && settings.cueNext && !(seg.ladder && seg.ladder.k > 1)) parts.push(spokenChordPlan(seg));
   if (settings.cueTip && seg.tip) parts.push(seg.tip);
   return parts.join(' ');
 }
@@ -1389,6 +1465,35 @@ function chordToneLabel(iv, quality) {
   return quality === 'minor' ? '♭3' : '3';
 }
 
+function showChordBoard(seg, step, playing, force) {
+  const host = $('s-board');
+  const ci = clamp(Math.floor(step / seg.chordBeats), 0, seg.chordSeq.length - 1);
+  const sh = seg.chordSeq[ci], next = seg.chordSeq[ci + 1];
+  const left = seg.chordBeats - (step % seg.chordBeats);
+  const hasNext = !!next && (ci + 1) * seg.chordBeats < seg.totalSteps;
+  const warn = playing && hasNext && left <= (seg.chordBeats >= 8 ? 4 : 2);
+  const key = `chord${S.i}:${ci}:${warn ? 1 : 0}`;
+  if (Board.key !== key || force) {
+    const notes = sh.notes.map(n => ({ s: n.s, f: n.f, cls: n.iv === 0 ? 'root cur' : 'tri', label: Theory.chordLabel(n.iv) }));
+    if (warn && next.name !== sh.name) {
+      const here = new Set(sh.notes.map(n => n.s + ':' + n.f));
+      next.notes.forEach(n => { if (!here.has(n.s + ':' + n.f)) notes.push({ s: n.s, f: n.f, cls: 'ghost', label: Theory.chordLabel(n.iv) }); });
+    }
+    host.innerHTML = Theory.drawBoard({ lo: seg.chordLo, hi: seg.chordHi, notes });
+    $('s-mini').innerHTML = '';
+    Board.key = key;
+  }
+  let html;
+  if (!playing) html = `<span class="cap-dim">First chord:</span> <span class="ch chname">${sh.name}</span>`;
+  else {
+    html = `<span class="ch chname">${sh.name}</span>`;
+    if (warn) html += `<span class="nx">→ ${next.name} in ${left}</span>`;
+    else if (hasNext) html += `<span class="nx dim">next ${next.name}</span>`;
+  }
+  const cap = $('s-caption');
+  if (cap.innerHTML !== html) cap.innerHTML = html;
+}
+
 function showProgBoard(seg, step, playing, force) {
   const host = $('s-board');
   const ci = Math.floor(step / seg.chordBeats) % seg.chords.length;
@@ -1501,6 +1606,7 @@ function showBoard(seg, force) {
     return;
   }
   if (seg.kind === 'prog') { showProgBoard(seg, step, playing, force); return; }
+  if (seg.chordSeq) { showChordBoard(seg, step, playing, force); return; }
   if (seg.kind === 'noteFind') {
     const pi = clamp(Math.floor(step / seg.cycle), 0, seg.prompts.length - 1);
     const pr = seg.prompts[pi];
@@ -1604,9 +1710,9 @@ function render() {
   const song = isSongSeg(seg), board = isBoardSeg(seg);
   $('session').classList.toggle('song', song);
   $('session').classList.toggle('board', board);
-  $('session').classList.toggle('prog', seg.kind === 'prog');
+  $('session').classList.toggle('prog', seg.kind === 'prog' || !!seg.chordSeq);
   const itemCount = S.routine.items.length;
-  const kindLabel = song ? 'Song' : seg.kind === 'scale' ? 'Scale' : seg.kind === 'prog' ? 'Backing track' : (seg.kind === 'noteFind' || seg.kind === 'callResp') ? 'Drill' : board ? 'Triads' : 'Exercise';
+  const kindLabel = seg.kind === 'exercise' ? 'Exercise' : song ? 'Song' : seg.kind === 'scale' ? 'Scale' : seg.kind === 'prog' ? 'Backing track' : (seg.kind === 'noteFind' || seg.kind === 'callResp') ? 'Drill' : board ? 'Triads' : 'Exercise';
   $('s-progress').textContent = `${kindLabel} · ${seg.item + 1} of ${itemCount}`;
   $('s-name').textContent = seg.name;
   const step = seg.ladder ? ` · step ${seg.ladder.k}/${seg.ladder.n}` : '';
@@ -1614,6 +1720,7 @@ function render() {
   else if (seg.kind === 'prog') $('s-sub').textContent = `${seg.feel === 'shuffle' ? 'Shuffle' : 'Straight'} · ${seg.bpm} BPM · ${capFirst(PROG_MODES[seg.mode])}${seg.mode === 'tones' ? ' · ' + Theory.noteName(seg.key) + ' ' + Theory.SCALES[seg.scale].name + ', pos ' + seg.p : ''}`;
   else if (seg.kind === 'noteFind') $('s-sub').textContent = `Frets 0–${seg.maxFret} · ${seg.bpm} BPM`;
   else if (seg.kind === 'callResp') $('s-sub').textContent = `${seg.title} · position ${seg.p} · ${seg.bpm} BPM`;
+  else if (seg.kind === 'exercise') $('s-sub').textContent = `${seg.bpm} BPM${step} · chord changes`;
   else if (board) $('s-sub').textContent = `${Theory.STRING_SETS[seg.set].label} strings · ${seg.bpm} BPM`;
   else $('s-sub').textContent = song ? `${seg.section} · ${seg.pct}%${step}` : `${seg.bpm} BPM${step}`;
   if (board) showBoard(seg);
@@ -2049,6 +2156,19 @@ function ladderInfoText(it) {
   return `${st.length} steps: ${st.join(' → ')}`;
 }
 
+function exerciseChordFields(it, i) {
+  const ex = findEx(it.exId);
+  const def = ex && chordCfgActive(ex.chords) ? chordCfgText(ex.chords) : 'off';
+  const use = !it.chords ? 'default' : it.chords.mode === 'off' ? 'off' : 'custom';
+  const opt = (v, label) => `<option value="${v}" ${use === v ? 'selected' : ''}>${label}</option>`;
+  return `<div class="chordbox">
+    <label class="field"><span>Chord prompts</span><select data-i="${i}" data-f="chordUse">
+      ${opt('default', `Exercise's setting (${esc(def)})`)}${opt('custom', 'Different chords in this routine')}${opt('off', 'Off in this routine')}
+    </select></label>
+    ${use === 'custom' ? `<div class="chordhost" data-host-i="${i}"></div>` : ''}
+  </div>`;
+}
+
 function renderRoutineEditor() {
   const v = $('view');
   let html = `<div class="row"><button class="btn small" data-act="cancel">‹ Back</button></div>
@@ -2115,8 +2235,10 @@ function renderRoutineEditor() {
         <label class="field"><span>Sec</span><input type="number" inputmode="numeric" data-i="${i}" data-f="sec" value="${secs}"></label>
       </div>
       <button class="btn small" data-act="ladderOn" data-i="${i}">+ Speed ladder</button>`;
+      html += exerciseChordFields(it, i);
     } else {
       const l = it.ladder;
+      html += exerciseChordFields(it, i);
       html += `<div class="ladder-box">
         <div class="row"><b>Speed ladder</b><span class="spacer"></span><button class="btn small" data-act="ladderOff" data-i="${i}">Remove ladder</button></div>
         <div class="inline-fields">
@@ -2151,6 +2273,13 @@ function renderRoutineEditor() {
     ${draft.id ? `<button class="btn wide" data-act="duplicate">Duplicate routine</button>
     <button class="btn wide danger" data-act="delete">Delete routine</button>` : ''}`;
   v.innerHTML = html;
+  // chord settings for exercises that use their own chords in this routine
+  v.querySelectorAll('.chordhost').forEach(host => {
+    const it = draft.items[+host.dataset.hostI];
+    if (it && it.chords) chordWidget(host, it.chords, () => {
+      const tt = $('totalTime'); if (tt) tt.textContent = fmtShort(routineTotalSec(draft));
+    });
+  });
 }
 
 $('view').addEventListener('input', e => {
@@ -2163,7 +2292,7 @@ $('view').addEventListener('change', e => {
   if (draft && el.dataset.f && el.type === 'checkbox') updateDraftField(el);
   if (draft && el.dataset.f && el.tagName === 'SELECT') {
     updateDraftField(el);
-    if (/mode$|^b\.(scale|quality|p|len|timing|prog)$/.test(el.dataset.f)) {   // redraw to show the converted number / new name
+    if (/mode$|^b\.(scale|quality|p|len|timing|prog)$|^chordUse$/.test(el.dataset.f)) {   // redraw to show the converted number / new name
       const y = window.scrollY; renderRoutineEditor(); window.scrollTo(0, y);
     }
   }
@@ -2190,6 +2319,14 @@ function updateDraftField(el) {
       else if (['bpm', 'rounds', 'posBreak', 'prompts', 'findBars', 'revealBars', 'bars', 'p', 'len', 'maxLen', 'maxFret', 'findSecs', 'revealSecs', 'barsPer', 'reps'].includes(k)) it[k] = Math.max(k === 'posBreak' ? 0 : 1, num(el.value, it[k]));
       else if (k === 'positions') it[k] = el.value === 'all' ? 'all' : num(el.value, 1);
       else it[k] = el.value;
+    }
+    else if (f === 'chordUse') {
+      if (el.value === 'default') delete it.chords;
+      else if (el.value === 'off') it.chords = { mode: 'off', list: [], pool: 'open', every: 2 };
+      else if (!it.chords || it.chords.mode === 'off') {
+        const ex = findEx(it.exId);
+        it.chords = ex && chordCfgActive(ex.chords) ? cleanChordCfg(ex.chords) : { mode: 'list', list: [], pool: 'open', every: 2 };
+      }
     }
     else if (f === 'bpm') it.bpm = clamp(num(el.value, 80), 20, 400);
     else if (f === 'speed') it.speed = clamp(num(el.value, 100), 25, 150);
@@ -2329,7 +2466,12 @@ $('view').addEventListener('click', e => {
   const act = b.dataset.act;
   if (act === 'save') {
     if (!draft.name.trim()) { toast('Give the routine a name'); return; }
-    draft.items.forEach(it => { if (!isSongItem(it)) { const ex = findEx(it.exId); if (ex) it.name = ex.name; } });
+    draft.items.forEach(it => {
+      if (!isSongItem(it)) { const ex = findEx(it.exId); if (ex) it.name = ex.name; }
+      if (it.chords) it.chords = cleanChordCfg(it.chords);
+    });
+    const badChords = draft.items.find(it => it.chords && it.chords.mode !== 'off' && !chordCfgActive(it.chords));
+    if (badChords) { toast('An exercise needs at least two chords (or set its chord prompts back)'); return; }
     if (draft.id) { const k = routines.findIndex(r => r.id === draft.id); routines[k] = draft; }
     else { draft.id = uid(); routines.push(draft); }
     saveRoutines(); draft = null; toast('Routine saved'); showTab('routines'); return;
@@ -2705,6 +2847,7 @@ function renderExercises() {
       <div class="row"><div class="title" style="flex:1">${esc(e.name)}</div><button class="btn small" data-exedit="${e.id}">Edit</button></div>
       <div class="meta">${esc(e.bpm)} BPM · ${fmtShort(e.duration)}</div>
       ${e.tip ? `<div class="meta" style="margin-top:6px">💬 ${esc(e.tip)}</div>` : ''}
+      ${chordCfgActive(e.chords) ? `<div class="meta" style="margin-top:6px">🎸 ${esc(chordCfgText(e.chords))}</div>` : ''}
     </div>`;
   }
   html += `<button class="btn wide primary" id="newEx">+ New exercise</button>
@@ -2714,15 +2857,73 @@ function renderExercises() {
   $('newEx').addEventListener('click', () => editExercise(null));
   $('restoreEx').addEventListener('click', () => {
     let added = 0;
-    for (const b of BUILTIN_EXERCISES) if (!findEx(b.id)) { exercises.push(Object.assign({}, b)); added++; }
+    for (const b of BUILTIN_EXERCISES) if (!findEx(b.id)) { exercises.push(JSON.parse(JSON.stringify(b))); added++; }
     saveExercises(); toast(added ? `Restored ${added} drill${added === 1 ? '' : 's'}` : 'All built-in drills are already here');
     renderExercises();
   });
 }
 
+/* ---------- Chord prompt settings (used in the Exercises tab and in routines) ---------- */
+function blankChordCfg() { return { mode: 'off', list: [], pool: 'open', every: 2 }; }
+
+// Draw the chord settings into `host`, editing `cfg` in place; onChange runs after every change
+function chordWidget(host, cfg, onChange) {
+  cfg.list = Array.isArray(cfg.list) ? cfg.list : [];
+  cfg.pool = Theory.CHORD_POOLS[cfg.pool] ? cfg.pool : 'open';
+  cfg.every = clamp(Math.round(num(cfg.every, 2)), 1, 8);
+  const opt = (v, cur, label) => `<option value="${v}" ${String(cur) === String(v) ? 'selected' : ''}>${label}</option>`;
+  const usesList = cfg.mode === 'list' || (cfg.mode === 'random' && cfg.pool === 'list');
+  let h = `<label class="field"><span>Chord prompts</span><select data-ce="mode">
+      ${opt('off', cfg.mode, 'Off — just the metronome')}${opt('list', cfg.mode, 'My chords, in order')}${opt('random', cfg.mode, 'Random chords')}
+    </select></label>`;
+  if (cfg.mode === 'random') {
+    h += `<label class="field"><span>Pick from</span><select data-ce="pool">
+      ${Object.keys(Theory.CHORD_POOLS).map(k => opt(k, cfg.pool, Theory.CHORD_POOLS[k].label)).join('')}
+    </select></label>`;
+  }
+  if (usesList) {
+    h += `<div class="flabel">My chords</div><div class="cchips">${cfg.list.length
+      ? cfg.list.map((id, j) => `<span class="cchip">${Theory.chordName(id)}<button data-ce-del="${j}" aria-label="Remove">✕</button></span>`).join(cfg.mode === 'list' ? '<span class="carrow">→</span>' : '')
+      : '<span class="muted">No chords yet — add at least two below.</span>'}</div>
+      <div class="row cadd">
+        <select data-ce="root">${Theory.CIRCLE.slice().sort((a, b) => a - b).map(pc => opt(pc, cfg._root != null ? cfg._root : 9, Theory.noteName(pc))).join('')}</select>
+        <select data-ce="type">${Theory.CHORD_TYPE_ORDER.map(t => opt(t, cfg._type || 'maj', Theory.CHORD_TYPES[t].label)).join('')}</select>
+        <button class="btn small primary" data-ce-add="1">+ Add</button>
+      </div>`;
+  }
+  if (cfg.mode !== 'off') {
+    h += `<label class="field"><span>Change chord every</span><select data-ce="every">${[1, 2, 4].map(n => opt(n, cfg.every, n + (n === 1 ? ' bar' : ' bars'))).join('')}</select></label>`;
+  }
+  h += `<p class="muted sum">${esc(chordCfgText(cfg))}${usesList && cfg.list.length < 2 && cfg.mode !== 'off' ? ' · add at least two chords' : ''}</p>`;
+  host.innerHTML = h;
+  const redraw = () => { chordWidget(host, cfg, onChange); if (onChange) onChange(); };
+  host.querySelectorAll('select[data-ce]').forEach(el => el.addEventListener('change', () => {
+    const k = el.dataset.ce;
+    if (k === 'root') { cfg._root = +el.value; return; }
+    if (k === 'type') { cfg._type = el.value; return; }
+    cfg[k] = k === 'every' ? +el.value : el.value;
+    redraw();
+  }));
+  const add = host.querySelector('[data-ce-add]');
+  if (add) add.addEventListener('click', () => {
+    const root = +host.querySelector('[data-ce=root]').value, type = host.querySelector('[data-ce=type]').value;
+    cfg._root = root; cfg._type = type;
+    cfg.list.push(Theory.chordId(root, type));
+    redraw();
+  });
+  host.querySelectorAll('[data-ce-del]').forEach(b => b.addEventListener('click', () => { cfg.list.splice(+b.dataset.ceDel, 1); redraw(); }));
+}
+// Strip the widget's temporary picker memory before saving
+function cleanChordCfg(cfg) {
+  if (!cfg) return cfg;
+  const c = { mode: cfg.mode, list: (cfg.list || []).slice(), pool: cfg.pool, every: cfg.every };
+  return c;
+}
+
 function editExercise(id) {
   const e = id ? findEx(id) : null;
-  exDraft = e ? Object.assign({}, e) : { id: null, name: '', bpm: 80, duration: 120, tip: '' };
+  exDraft = e ? JSON.parse(JSON.stringify(e)) : { id: null, name: '', bpm: 80, duration: 120, tip: '' };
+  if (!exDraft.chords) exDraft.chords = blankChordCfg();
   const v = $('view');
   const m = Math.floor(exDraft.duration / 60), s = Math.round(exDraft.duration % 60);
   v.innerHTML = `<div class="row"><button class="btn small" id="exBack">‹ Back</button></div>
@@ -2734,8 +2935,11 @@ function editExercise(id) {
       <label class="field"><span>Sec</span><input type="number" inputmode="numeric" id="exSec" value="${s}"></label>
     </div>
     <label class="field"><span>Spoken tip (optional)</span><textarea id="exTip" placeholder="Said out loud before the exercise starts">${esc(exDraft.tip)}</textarea></label>
+    <h2>Chords to change between</h2>
+    <div class="card" id="exChords"></div>
     <button class="btn wide primary" id="exSave">Save exercise</button>
     ${id ? `<button class="btn wide danger" id="exDel">Delete exercise</button>` : ''}`;
+  chordWidget($('exChords'), exDraft.chords);
   $('exBack').addEventListener('click', renderExercises);
   $('exSave').addEventListener('click', () => {
     const name = $('exName').value.trim();
@@ -2744,6 +2948,8 @@ function editExercise(id) {
     exDraft.bpm = clamp(Math.round(num($('exBpm').value, 80)), 20, 400);
     exDraft.duration = Math.max(5, num($('exMin').value, 0) * 60 + num($('exSec').value, 0));
     exDraft.tip = $('exTip').value.trim();
+    exDraft.chords = cleanChordCfg(exDraft.chords);
+    if (exDraft.chords.mode !== 'off' && !chordCfgActive(exDraft.chords)) { toast('Add at least two chords, or turn chord prompts off'); return; }
     if (exDraft.id) { const k = exercises.findIndex(x => x.id === exDraft.id); exercises[k] = exDraft; }
     else { exDraft.id = uid(); exercises.push(exDraft); }
     saveExercises(); toast('Exercise saved'); renderExercises();

@@ -291,6 +291,14 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .rank-row .btn.small { padding: 6px 10px; min-height: 38px; }
 .sp-row { display: flex; justify-content: space-between; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); font-weight: 600; }
 .sp-row:last-child { border-bottom: 0; }
+.chordbox { margin-top: 8px; }
+.chordhost { border: 1px dashed var(--line); border-radius: 10px; padding: 4px 10px; margin-bottom: 8px; }
+.cchips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 4px 0 8px; }
+.cchip { display: inline-flex; align-items: center; gap: 4px; background: var(--accent); color: #111; font-weight: 800; border-radius: 10px; padding: 6px 4px 6px 12px; font-size: 18px; }
+.cchip button { background: none; border: 0; color: #111; font-size: 15px; padding: 2px 8px; }
+.carrow { color: var(--dim); font-weight: 700; }
+.cadd select { flex: 1; min-width: 0; }
+#s-caption .ch.chname { font-family: inherit; font-weight: 900; margin-right: 3vw; }
 .fixed { padding: 12px; color: var(--dim); border: 1px dashed var(--line); border-radius: 10px; }
 .n.faint circle { opacity: 0.35; }
 .n.faint text { opacity: 0.45; }
