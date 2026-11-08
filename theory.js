@@ -133,8 +133,13 @@ const Theory = (() => {
   }
 
   // Walk the neck: root position → 1st → 2nd → root an octave up, then back down
-  function triadWalk(rootPc, quality, setId) {
+  function triadWalk(rootPc, quality, setId, invs) {
     const all = triadShapes(rootPc, quality, setId);
+    if (invs && invs.length && invs.length < 3) {
+      // Only some shapes chosen: every place those shapes appear, up the neck and back
+      const up = all.filter(sh => invs.includes(sh.inv));
+      return up.concat(up.slice(0, -1).reverse());
+    }
     let start = all.findIndex(sh => sh.inv === 0);
     if (start < 0) start = 0;
     if (start + 3 >= all.length) start = Math.max(0, all.length - 4);

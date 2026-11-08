@@ -474,6 +474,15 @@ function songSegment(item, idx, song, sec, pct, mode, amount) {
 /* ---------- Scale guide and triad segments (Phase 3) ---------- */
 const isBoardSeg = seg => !!seg && (seg.kind === 'scale' || seg.kind === 'triadWalk' || seg.kind === 'triadQuiz');
 function itemKeys(it) { return Array.isArray(it.keys) && it.keys.length ? it.keys.slice() : [0]; }
+function itemInvs(it) {
+  const v = Array.isArray(it.invs) ? it.invs.filter(n => n === 0 || n === 1 || n === 2) : [];
+  return v.length ? v.sort() : [0, 1, 2];
+}
+function invsText(it) {
+  const v = itemInvs(it);
+  if (v.length === 3) return '';
+  return v.map(n => ['root position', '1st inversion', '2nd inversion'][n]).join(' + ');
+}
 function itemQualities(it) { return it.quality === 'both' ? ['major', 'minor'] : [it.quality === 'minor' ? 'minor' : 'major']; }
 function shuffleList(a) {
   for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
@@ -517,7 +526,8 @@ function triadSegments(item, idx, brk) {
     for (let k = 0; k < n; k++) {
       let pr, tries = 0;
       do {
-        pr = { key: keys[Math.floor(Math.random() * keys.length)], quality: quals[Math.floor(Math.random() * quals.length)], inv: Math.floor(Math.random() * 3) };
+        const invs = itemInvs(item);
+        pr = { key: keys[Math.floor(Math.random() * keys.length)], quality: quals[Math.floor(Math.random() * quals.length)], inv: invs[Math.floor(Math.random() * invs.length)] };
         tries++;
       } while (tries < 12 && `${pr.key}${pr.quality}${pr.inv}` === last);
       last = `${pr.key}${pr.quality}${pr.inv}`;
@@ -535,7 +545,7 @@ function triadSegments(item, idx, brk) {
   const combos = [];
   keys.forEach(k => quals.forEach(q => combos.push({ k, q })));
   return combos.map((c, j) => {
-    const shapes = Theory.triadWalk(c.k, c.q, set);
+    const shapes = Theory.triadWalk(c.k, c.q, set, itemInvs(item));
     const dur = shapes.length * bps * 60 / bpm;
     return {
       kind: 'triadWalk', item: idx, name: `${Theory.noteName(c.k)} ${c.q} triads`, key: c.k, quality: c.q, set, bpm, shapes, bps,
@@ -1417,7 +1427,8 @@ function itemName(it) {
   if (it.type === 'triad') {
     const q = it.quality === 'both' ? 'major & minor' : (it.quality || 'major');
     const keys = itemKeys(it).map(Theory.noteName).join(', ');
-    return it.mode === 'quiz' ? `🔺 Triad quiz – ${keys}` : `🔺 Triads – ${keys} ${q}`;
+    const v = itemInvs(it), shp = v.length === 3 ? '' : ' · ' + v.map(n => ['root', '1st', '2nd'][n]).join('+');
+    return it.mode === 'quiz' ? `🔺 Triad quiz – ${keys}${shp}` : `🔺 Triads – ${keys} ${q}${shp}`;
   }
   if (isSongItem(it)) {
     const song = findSong(it.songId), sec = findSection(song, it.sectionId);
@@ -1470,6 +1481,12 @@ function boardItemFields(it, i) {
     ${chk('tones', it.tones !== false, 'Soft tone on each note')}`;
   } else {
     h += keyCircle(i, itemKeys(it), true);
+    h += `<div class="row keybtns"><button class="btn small" data-act="allkeys" data-i="${i}">All 12 keys</button>
+      <button class="btn small" data-act="onekey" data-i="${i}">Just one key</button></div>`;
+    const inv = itemInvs(it);
+    h += `<div class="field"><span class="flabel">Shapes</span><div class="chips">
+      ${['Root', '1st inv', '2nd inv'].map((t, n) => `<button class="chip${inv.includes(n) ? ' on' : ''}" data-act="inv" data-i="${i}" data-n="${n}">${t}</button>`).join('')}
+    </div></div>`;
     h += `<div class="inline-fields">
       ${sel('quality', 'Chords', opt('major', it.quality, 'Major') + opt('minor', it.quality, 'Minor') + opt('both', it.quality, 'Both'))}
       ${sel('strings', 'Strings', Object.keys(Theory.STRING_SETS).map(k => opt(k, it.strings, Theory.STRING_SETS[k].label)).join(''))}
@@ -1496,12 +1513,19 @@ function boardSummary(it) {
   }
   const keys = itemKeys(it).map(Theory.noteName).join(', ');
   const q = it.quality === 'both' ? 'major and minor' : (it.quality || 'major');
+  const only = invsText(it) ? ` (${invsText(it)} only)` : '';
   if (it.mode === 'quiz') {
     const fb = num(it.findBars, 2);
-    return `${num(it.prompts, 10)} random ${q} triads in ${keys}. ${fb} bar${fb === 1 ? '' : 's'} to find each one, then it's shown — about ${total}.`;
+    return `${num(it.prompts, 10)} random ${q} triads${only} in ${keys}. ${fb} bar${fb === 1 ? '' : 's'} to find each one, then it's shown — about ${total}.`;
   }
   const bars = num(it.bars, 2);
-  return `${keys} ${q}: 7 shapes up the neck and back, ${bars} bar${bars === 1 ? '' : 's'} each — about ${total}.`;
+  const n = segs.length ? segs[0].shapes.length : 7;
+  const per = `${bars} bar${bars === 1 ? '' : 's'} each`;
+  const nk = itemKeys(it).length;
+  const how = n === 1 ? `one shape per key, held for ${bars} bar${bars === 1 ? '' : 's'}`
+                      : `${n} shapes up the neck and back${nk > 1 ? ' in each key' : ''}, ${per}`;
+  const hint = invsText(it) && nk === 1 ? ' Tip: add more keys to practice this shape all over the neck.' : '';
+  return `${nk > 3 ? nk + ' keys' : keys} ${q}${only}: ${how} — about ${total}.${hint}`;
 }
 function itemSummary(it) { return isBoardItem(it) ? boardSummary(it) : songSummary(it); }
 
@@ -1536,16 +1560,6 @@ function ladderInfoText(it) {
 
 function renderRoutineEditor() {
   const v = $('view');
-  let addOptions = `<optgroup label="Exercises">${exercises.map(e => `<option value="ex:${e.id}">${esc(e.name)}</option>`).join('')}</optgroup>`;
-  addOptions += `<optgroup label="Scales & triads">
-      <option value="scale:new">🎼 Scale guide</option>
-      <option value="triad:walk">🔺 Triads – walk the neck</option>
-      <option value="triad:quiz">🔺 Triads – name it, find it</option>
-    </optgroup>`;
-  if (songs.length) {
-    addOptions += `<optgroup label="Songs">${songs.map(s => s.sections.map(sec =>
-      `<option value="song:${s.id}:${sec.id}">🎵 ${esc(s.name)} – ${esc(sec.name)}</option>`).join('')).join('')}</optgroup>`;
-  }
   let html = `<div class="row"><button class="btn small" data-act="cancel">‹ Back</button></div>
     <h1>${draft.id ? 'Edit routine' : 'New routine'}</h1>
     <label class="field"><span>Routine name</span><input type="text" data-f="name" value="${esc(draft.name)}"></label>
@@ -1633,8 +1647,12 @@ function renderRoutineEditor() {
     html += `</div>`;
   });
   html += `<h2>Add to routine</h2>
-    <div class="row"><select id="addSel" style="flex:1">${addOptions}</select><button class="btn primary" data-act="add">Add</button></div>
-    ${songs.length ? '' : '<p class="muted">Import songs in the Songs tab to add them here.</p>'}
+    <div class="addgrid">
+      <button class="btn addbtn" data-act="pick" data-kind="exercise">＋ Exercise</button>
+      <button class="btn addbtn" data-act="pick" data-kind="scale">＋ Scale</button>
+      <button class="btn addbtn" data-act="pick" data-kind="triad">＋ Triads</button>
+      <button class="btn addbtn" data-act="pick" data-kind="song">＋ Song</button>
+    </div>
     <div class="row" style="margin-top:28px">
       <button class="btn primary" data-act="save" style="flex:1">Save routine</button>
     </div>
@@ -1728,6 +1746,22 @@ $('view').addEventListener('click', e => {
   if (act === 'remove') draft.items.splice(i, 1);
   if (act === 'ladderOn') draft.items[i].ladder = isSongItem(draft.items[i]) ? defaultSongLadder() : defaultLadder(num(draft.items[i].bpm, 80));
   if (act === 'ladderOff') draft.items[i].ladder = null;
+  if (act === 'inv') {
+    const it = draft.items[i], n = +b.dataset.n, v = itemInvs(it), at = v.indexOf(n);
+    if (at >= 0) {
+      if (v.length === 1) { toast('Keep at least one shape'); return; }
+      v.splice(at, 1);
+    } else v.push(n);
+    it.invs = v.sort();
+    const y = window.scrollY; renderRoutineEditor(); window.scrollTo(0, y);
+    return;
+  }
+  if (act === 'allkeys' || act === 'onekey') {
+    const it = draft.items[i];
+    it.keys = act === 'allkeys' ? Theory.CIRCLE.slice() : [itemKeys(it)[0]];
+    const y = window.scrollY; renderRoutineEditor(); window.scrollTo(0, y);
+    return;
+  }
   if (act === 'key') {
     const it = draft.items[i], pc = +b.dataset.pc;
     if (it.type === 'scale') it.key = pc;
@@ -1742,8 +1776,14 @@ $('view').addEventListener('click', e => {
     const y = window.scrollY; renderRoutineEditor(); window.scrollTo(0, y);
     return;
   }
-  if (act === 'add') {
-    const val = $('addSel').value || '';
+  if (act === 'pick') { openPicker(b.dataset.kind); return; }
+  if (act === 'save' || act === 'duplicate' || act === 'delete') return;   // handled below
+  const y = window.scrollY; renderRoutineEditor(); window.scrollTo(0, y);
+});
+
+// Add one thing to the routine being edited
+function addToDraft(val) {
+  {
     if (val.startsWith('ex:')) {
       const ex = findEx(val.slice(3));
       if (ex) draft.items.push({ exId: ex.id, name: ex.name, bpm: ex.bpm, duration: ex.duration, ladder: null });
@@ -1762,6 +1802,12 @@ $('view').addEventListener('click', e => {
       }
     }
   }
+}
+
+$('view').addEventListener('click', e => {
+  const b = e.target.closest('[data-act]');
+  if (!b || !draft) return;
+  const act = b.dataset.act;
   if (act === 'save') {
     if (!draft.name.trim()) { toast('Give the routine a name'); return; }
     draft.items.forEach(it => { if (!isSongItem(it)) { const ex = findEx(it.exId); if (ex) it.name = ex.name; } });
@@ -1777,7 +1823,81 @@ $('view').addEventListener('click', e => {
     if (!confirm(`Delete "${draft.name}"?`)) return;
     routines = routines.filter(r => r.id !== draft.id); saveRoutines(); draft = null; showTab('routines'); return;
   }
-  renderRoutineEditor();
+});
+
+/* ---------- Picker: one short list per kind of thing ---------- */
+let pickerKind = null, pickerAdded = 0;
+function openPicker(kind) {
+  if (kind === 'scale') {
+    // Only one kind of scale item — add it straight away and jump to it
+    addToDraft('scale:new');
+    renderRoutineEditor();
+    scrollToLastItem();
+    toast('Scale guide added — pick the key and scale');
+    return;
+  }
+  pickerKind = kind; pickerAdded = 0;
+  const titles = { exercise: 'Add an exercise', triad: 'Add triads', song: 'Add a song' };
+  $('pk-title').textContent = titles[kind];
+  const search = $('pk-search');
+  search.value = '';
+  const count = kind === 'exercise' ? exercises.length : kind === 'song' ? songs.reduce((t, x) => t + x.sections.length, 0) : 0;
+  search.hidden = count < 8;
+  renderPickerList();
+  $('picker').hidden = false;
+  document.body.classList.add('noscroll');
+}
+
+function renderPickerList() {
+  const q = $('pk-search').value.trim().toLowerCase();
+  const match = t => !q || t.toLowerCase().includes(q);
+  let h = '';
+  if (pickerKind === 'exercise') {
+    const list = exercises.filter(e => match(e.name));
+    h = list.map(e => `<button class="pk-row" data-add="ex:${e.id}"><b>${esc(e.name)}</b><span>${esc(e.bpm)} BPM · ${fmtShort(e.duration)}</span></button>`).join('')
+      || '<div class="empty">No exercises match.</div>';
+  } else if (pickerKind === 'triad') {
+    h = `<button class="pk-row" data-add="triad:walk"><b>🔺 Walk the neck</b><span>Learn the shapes: they climb the neck in time with the click</span></button>
+         <button class="pk-row" data-add="triad:quiz"><b>🔺 Name it, find it</b><span>Test yourself: the voice calls a triad, then it's shown</span></button>`;
+  } else if (pickerKind === 'song') {
+    if (!songs.length) h = '<div class="empty">No songs yet. Import one in the Songs tab first.</div>';
+    for (const s of songs) {
+      const secs = s.sections.filter(x => match(s.name + ' ' + x.name));
+      if (!secs.length) continue;
+      h += `<div class="pk-group">🎵 ${esc(s.name)}</div>` + secs.map(x =>
+        `<button class="pk-row sub" data-add="song:${s.id}:${x.id}"><b>${esc(x.name)}</b><span>${fmtPos(x.end - x.start)} long</span></button>`).join('');
+    }
+    if (songs.length && !h) h = '<div class="empty">No songs match.</div>';
+  }
+  $('pk-list').innerHTML = h;
+}
+
+function closePicker() {
+  $('picker').hidden = true;
+  document.body.classList.remove('noscroll');
+  const added = pickerAdded;
+  pickerKind = null;
+  if (added && draft) { renderRoutineEditor(); scrollToLastItem(); }
+}
+
+function scrollToLastItem() {
+  const items = document.querySelectorAll('#view .item');
+  const last = items[items.length - 1];
+  if (last) last.scrollIntoView({ block: 'center' });
+}
+
+$('pk-search').addEventListener('input', renderPickerList);
+$('pk-close').addEventListener('click', closePicker);
+$('picker').addEventListener('click', e => {
+  if (e.target.id === 'picker') { closePicker(); return; }   // tapped outside the sheet
+  const row = e.target.closest('[data-add]');
+  if (!row || !draft) return;
+  addToDraft(row.dataset.add);
+  pickerAdded++;
+  row.classList.add('added');
+  setTimeout(() => row.classList.remove('added'), 700);
+  toast(`Added ✓  (${pickerAdded})`);
+  if (pickerKind === 'triad') closePicker();   // only one triad item is usually wanted
 });
 
 /* ---------- Exercise library ---------- */
