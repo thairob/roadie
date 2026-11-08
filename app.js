@@ -249,16 +249,77 @@ function playTone(time, midi, level) {
   o.start(time); o.stop(time + (level ? 0.8 : 0.6));
 }
 
+/* ---------- Backing band (Phase 4B): drums and bass made on the phone ---------- */
+function drumKick(t) {
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(150, t);
+  o.frequency.exponentialRampToValueAtTime(45, t + 0.12);
+  g.gain.setValueAtTime(0.95, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t + 0.4);
+}
+function drumSnare(t) {
+  const n = ctx.createBufferSource(); n.buffer = noiseBuf;
+  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1800; bp.Q.value = 0.7;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.55, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.17);
+  n.connect(bp); bp.connect(g); g.connect(master); n.start(t); n.stop(t + 0.2);
+  const o = ctx.createOscillator(), g2 = ctx.createGain();
+  o.type = 'triangle'; o.frequency.value = 190;
+  g2.gain.setValueAtTime(0.3, t); g2.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+  o.connect(g2); g2.connect(master); o.start(t); o.stop(t + 0.12);
+}
+function drumHat(t, level) {
+  const n = ctx.createBufferSource(); n.buffer = noiseBuf;
+  const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 7500;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(level, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.045);
+  n.connect(hp); hp.connect(g); g.connect(master); n.start(t); n.stop(t + 0.06);
+}
+function bassNote(t, midi, dur) {
+  const o = ctx.createOscillator(), lp = ctx.createBiquadFilter(), g = ctx.createGain();
+  o.type = 'sawtooth'; o.frequency.value = 440 * Math.pow(2, (midi - 69) / 12);
+  lp.type = 'lowpass'; lp.frequency.value = 650; lp.Q.value = 3;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(0.42, t + 0.006);
+  g.gain.exponentialRampToValueAtTime(0.25, t + dur * 0.6);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(lp); lp.connect(g); g.connect(master); o.start(t); o.stop(t + dur + 0.02);
+}
+// One beat of the band. Straight: rock 8ths. Shuffle: swung 8ths and a boogie bass line.
+function playBandBeat(seg, step, time) {
+  const iv = 60 / seg.bpm, b = step % 4;
+  const chord = seg.chords[Math.floor(step / seg.chordBeats) % seg.chords.length];
+  const root = 28 + Theory.pcOf(chord.root - 4);              // E1 … D#2
+  const off = seg.feel === 'shuffle' ? iv * 2 / 3 : iv / 2;
+  if (b === 0 || b === 2) drumKick(time);
+  if (b === 1 || b === 3) drumSnare(time);
+  if (seg.feel !== 'shuffle' && b === 2) drumKick(time + off);
+  drumHat(time, b % 2 ? 0.16 : 0.22);
+  drumHat(time + off, 0.12);
+  if (seg.feel === 'shuffle') {
+    const steps = chord.quality === 'minor' ? [0, 7, 10, 7] : [0, 7, 9, 7];   // root, 5th, 6th (or ♭7), 5th
+    const m = root + steps[b];
+    bassNote(time, m, off * 0.95);
+    bassNote(time + off, m, (iv - off) * 0.95);
+  } else {
+    bassNote(time, root, off * 0.9);
+    bassNote(time + off, root, off * 0.9);
+  }
+}
+
 const Metro = {
   running: false, bpm: 80, nextTime: 0, beat: 0, countIn: 4, countOnly: false, timer: null,
   queue: [],              // scheduled beats for the visual flash: {time, beat, accent}
   onBeat: null,           // called when a beat is actually heard
-  start(bpm, startTime, countIn, countOnly, limit) {
+  start(bpm, startTime, countIn, countOnly, limit, quiet) {
     this.stop();
     this.bpm = bpm; this.nextTime = startTime; this.countIn = countIn;
     this.countOnly = !!countOnly;   // songs: click the count-in only, then go quiet
     this.limit = limit == null ? null : Math.max(0, limit);   // drills: stop after this many beats
     this.limitReached = false; this.endTime = 0;
+    this.quiet = !!quiet;            // backing tracks: count-in clicks only, the drums keep time after that
     this.beat = -countIn;           // negative beats = count-in
     this.running = true;
     this.schedule();
@@ -283,7 +344,7 @@ const Metro = {
         return;
       }
       const accent = this.beat < 0 ? this.beat === -this.countIn : (this.beat % bpb === 0);
-      playClick(this.nextTime, accent);
+      if (!(this.quiet && this.beat >= 0)) playClick(this.nextTime, accent);
       if (this.onSchedule) this.onSchedule(this.beat, this.nextTime);
       this.queue.push({ time: this.nextTime, beat: this.beat, accent });
       this.nextTime += interval;
@@ -503,7 +564,42 @@ function songSegment(item, idx, song, sec, pct, mode, amount) {
 }
 
 /* ---------- Scale guide and triad segments (Phase 3) ---------- */
-const BOARD_KINDS = ['scale', 'triadWalk', 'triadQuiz', 'noteFind', 'callResp'];
+const BOARD_KINDS = ['scale', 'triadWalk', 'triadQuiz', 'noteFind', 'callResp', 'prog'];
+const PROG_MODES = { play: 'play along', tones: 'chord tones', triads: 'triads' };
+
+function progSegments(item, idx, brk) {
+  const progId = Theory.PROGRESSIONS[item.prog] ? item.prog : 'rock';
+  const pr = Theory.PROGRESSIONS[progId];
+  const key = Theory.pcOf(num(item.key, 9));
+  const bpm = clamp(Math.round(num(item.bpm, pr.bpm)), 40, 220);
+  const bpc = pr.oneBar ? 1 : clamp(Math.round(num(item.barsPer, 2)), 1, 4);
+  const reps = clamp(Math.round(num(item.reps, 4)), 1, 30);
+  const chords = Theory.progChords(key, progId);
+  const chordBeats = bpc * 4;                       // backing tracks are always in 4/4
+  const totalSteps = chords.length * chordBeats * reps;
+  const mode = PROG_MODES[item.mode] ? item.mode : 'play';
+  const seg = {
+    kind: 'prog', mode, item: idx, key, progId, pr, chords, bpm, bpc, chordBeats, reps, totalSteps,
+    feel: item.feel === 'shuffle' ? 'shuffle' : 'straight',
+    name: `${pr.short} in ${Theory.noteName(key)}${pr.minor ? ' minor' : ''}`,
+    spokenName: `${pr.short} in ${Theory.spokenNote(key)}${pr.minor ? ' minor' : ''}`,
+    duration: totalSteps * 60 / bpm, durText: `${reps} times through`, ladder: null, tip: '', breakBefore: brk
+  };
+  if (mode === 'play') {
+    // power chords, each one close to the last (worked out twice so the loop joins up smoothly)
+    let prev = null, shapes = [];
+    for (let pass = 0; pass < 2; pass++) shapes = chords.map(c => { const pc = Theory.powerChord(c.root, prev); prev = pc.fret; return pc; });
+    seg.shapes = shapes;
+  } else if (mode === 'tones') {
+    seg.scale = Theory.SCALES[item.scale] ? item.scale : pr.scale;
+    seg.p = clamp(Math.round(num(item.p, 1)), 1, 5);
+    seg.pos = Theory.position(key, seg.scale, seg.p);
+  } else {
+    seg.set = Theory.STRING_SETS[item.strings] ? item.strings : 'gbe';
+    seg.shapes = Theory.triadPath(chords, seg.set);
+  }
+  return [seg];
+}
 const isBoardSeg = seg => !!seg && BOARD_KINDS.includes(seg.kind);
 const NATURALS = [0, 2, 4, 5, 7, 9, 11];
 function itemStrings(it) {
@@ -681,6 +777,14 @@ function boardAnnouncement(seg) {
     if (seg.posIdx > 0) return `Position ${seg.p}.`;
     return `Next up: ${seg.spokenName}, ${seg.all ? 'all 5 positions' : 'position ' + seg.p}, ${seg.bpm} BPM.`;
   }
+  if (seg.kind === 'prog') {
+    const list = Theory.progChordList(seg.key, seg.progId).map(c => c.spoken);
+    const chords = list.length > 1 ? list.slice(0, -1).join(', ') + ' and ' + list[list.length - 1] : list[0];
+    const what = seg.mode === 'play' ? 'Play along with the power chords.'
+      : seg.mode === 'tones' ? `Improvise in position ${seg.p}, and aim for the notes of each chord.`
+      : `Follow the triad shapes on the ${Theory.STRING_SETS[seg.set].spoken}.`;
+    return `Next up: ${seg.spokenName}, ${seg.bpm} BPM. The chords are ${chords}. ${what}`;
+  }
   if (seg.kind === 'noteFind') return `Next up: note finder, ${seg.prompts.length} notes. Find each one before it appears.`;
   if (seg.kind === 'callResp') return `Next up: call and response in ${seg.spokenTitle}, position ${seg.p}. Listen, then play it back.`;
   const strings = Theory.STRING_SETS[seg.set].spoken;
@@ -699,6 +803,7 @@ function buildSegments(routine) {
     if (item.type === 'triad') { triadSegments(item, idx, brk).forEach(x => segs.push(x)); return; }
     if (item.type === 'noteFind') { noteFindSegments(item, idx, brk).forEach(x => segs.push(x)); return; }
     if (item.type === 'callResp') { callRespSegments(item, idx, brk).forEach(x => segs.push(x)); return; }
+    if (item.type === 'prog') { progSegments(item, idx, brk).forEach(x => segs.push(x)); return; }
     if (isSongItem(item)) {
       const song = findSong(item.songId), sec = findSection(song, item.sectionId);
       if (!song || !sec) return;
@@ -923,7 +1028,7 @@ function enterCountIn(remaining, songState) {
   S.countBpm = bpm;
   S.countStart = now() + 0.15;
   S.playStart = S.countStart + 4 * 60 / bpm;
-  Metro.start(bpm, ctx.currentTime + 0.15, 4, isSongSeg(seg), isBoardSeg(seg) ? seg.totalSteps - S.stepBase : null);
+  Metro.start(bpm, ctx.currentTime + 0.15, 4, isSongSeg(seg), isBoardSeg(seg) ? seg.totalSteps - S.stepBase : null, seg.kind === 'prog');
   render();
 }
 
@@ -1258,6 +1363,11 @@ const Board = { key: '', els: [], cur: -1 };
 function onSchedule(beat, time) {
   const seg = curSeg();
   if (!seg || beat < 0) return;
+  if (seg.kind === 'prog') {
+    const step = S.stepBase + beat;
+    if (step < seg.totalSteps) playBandBeat(seg, step, time);
+    return;
+  }
   if (seg.kind === 'callResp') {
     // The phrase plays once to listen to, and again with the answer
     const step = S.stepBase + beat, ph = seg.phrases[phraseAt(seg, step)];
@@ -1269,6 +1379,71 @@ function onSchedule(beat, time) {
   if (seg.kind !== 'scale' || !seg.tones) return;
   const step = S.stepBase + beat;
   if (step < seg.path.length) playTone(time, seg.path[step].midi);
+}
+
+function chordToneLabel(iv, quality) {
+  if (iv === 0) return 'R';
+  if (iv === 7) return '5';
+  return quality === 'minor' ? '♭3' : '3';
+}
+
+function showProgBoard(seg, step, playing, force) {
+  const host = $('s-board');
+  const ci = Math.floor(step / seg.chordBeats) % seg.chords.length;
+  const chord = seg.chords[ci];
+  // Look ahead to the next *different* chord (the blues stays on A for several bars)
+  let ahead = 1;
+  while (ahead < seg.chords.length && seg.chords[(ci + ahead) % seg.chords.length].name === chord.name) ahead++;
+  const nextIdx = (ci + ahead) % seg.chords.length, next = seg.chords[nextIdx];
+  const left = ahead * seg.chordBeats - (step % seg.chordBeats);   // beats until the change
+  const lastChord = step + left >= seg.totalSteps || next.name === chord.name;
+  const warnBeats = seg.chordBeats >= 8 ? 4 : 2;
+  const warn = playing && !lastChord && left <= warnBeats;
+  const key = `prog${S.i}:${ci}:${warn ? 1 : 0}`;
+  if (Board.key !== key || force) {
+    let notes = [], lo, hi, active = null;
+    if (seg.mode === 'play' || seg.mode === 'triads') {
+      const lab = (n, c) => seg.mode === 'play' ? (n.iv === 0 ? 'R' : '5') : chordToneLabel(n.iv, c.quality);
+      seg.shapes[ci].notes.forEach(n => notes.push({ s: n.s, f: n.f, cls: n.iv === 0 ? 'root cur' : 'tri', label: lab(n, chord) }));
+      if (warn && seg.shapes[nextIdx] !== seg.shapes[ci]) {
+        // outline the next shape, except where a finger stays on the same spot
+        const here = new Set(seg.shapes[ci].notes.map(n => n.s + ':' + n.f));
+        seg.shapes[nextIdx].notes.forEach(n => { if (!here.has(n.s + ':' + n.f)) notes.push({ s: n.s, f: n.f, cls: 'ghost', label: lab(n, next) }); });
+      }
+      const all = seg.shapes.flatMap(x => x.notes.map(n => n.f));
+      lo = Math.max(0, Math.min(...all) - 1);
+      hi = Math.max(lo + 6, Math.max(...all) + 1);
+      if (seg.mode === 'triads') active = Theory.STRING_SETS[seg.set].strings;
+    } else {
+      // chord tones bright over the faint scale position (plus chord tones the scale doesn't have)
+      const tones = [0, chord.quality === 'minor' ? 3 : 4, 7];
+      const pcs = new Map(tones.map(t => [Theory.pcOf(chord.root + t), t]));
+      lo = Math.max(0, seg.pos.lo - 1); hi = Math.max(lo + 5, seg.pos.hi + 1);
+      const taken = new Set();
+      seg.pos.notes.forEach(n => {
+        taken.add(n.s + ':' + n.f);
+        if (pcs.has(n.pc)) notes.push({ s: n.s, f: n.f, cls: pcs.get(n.pc) === 0 ? 'root cur' : 'tri', label: chordToneLabel(pcs.get(n.pc), chord.quality) });
+        else notes.push({ s: n.s, f: n.f, cls: 'faint', label: Theory.DEGREE[n.iv] });
+      });
+      for (let s = 0; s < 6; s++) for (let f = Math.max(seg.pos.lo, 0); f <= seg.pos.hi; f++) {
+        const pc = Theory.pcOf(Theory.OPEN[s] + f);
+        if (pcs.has(pc) && !taken.has(s + ':' + f)) notes.push({ s, f, cls: 'tri extra', label: chordToneLabel(pcs.get(pc), chord.quality) });
+      }
+    }
+    host.innerHTML = Theory.drawBoard({ lo, hi, notes, activeStrings: active });
+    $('s-mini').innerHTML = '';
+    Board.key = key;
+  }
+  // The big chord name, its number, and a countdown to the next change
+  let html;
+  if (!playing) html = `<span class="cap-dim">First chord:</span> <span class="ch">${chord.name}</span><span class="nm">${chord.num}</span>`;
+  else {
+    html = `<span class="ch">${chord.name}</span><span class="nm">${chord.num}</span>`;
+    if (warn) html += `<span class="nx">→ ${next.name} in ${left}</span>`;
+    else if (!lastChord) html += `<span class="nx dim">next ${next.name}</span>`;
+  }
+  const cap = $('s-caption');
+  if (cap.innerHTML !== html) cap.innerHTML = html;
 }
 
 function noteFindText(pr) {
@@ -1322,6 +1497,7 @@ function showBoard(seg, force) {
     if ($('s-caption').textContent !== cap) $('s-caption').textContent = cap;
     return;
   }
+  if (seg.kind === 'prog') { showProgBoard(seg, step, playing, force); return; }
   if (seg.kind === 'noteFind') {
     const pi = clamp(Math.floor(step / seg.cycle), 0, seg.prompts.length - 1);
     const pr = seg.prompts[pi];
@@ -1384,7 +1560,10 @@ function showBoard(seg, force) {
       const sh = seg.shapes[si];
       const lab = n => seg.labels === 'names' ? Theory.noteName(n.midi) : Theory.triadLabel(n.iv, seg.quality);
       const notes = sh.notes.map(n => ({ s: n.s, f: n.f, cls: n.iv === 0 ? 'root cur' : 'tri', label: lab(n) }));
-      if (inLast) seg.shapes[si + 1].notes.forEach(n => notes.push({ s: n.s, f: n.f, cls: 'ghost', label: lab(n) }));
+      if (inLast) {
+        const here = new Set(sh.notes.map(n => n.s + ':' + n.f));
+        seg.shapes[si + 1].notes.forEach(n => { if (!here.has(n.s + ':' + n.f)) notes.push({ s: n.s, f: n.f, cls: 'ghost', label: lab(n) }); });
+      }
       const lo = Math.max(0, Math.min(...seg.shapes.map(x => x.minF)) - 1);
       const hi = Math.max(lo + 6, Math.max(...seg.shapes.map(x => x.maxF)) + 1);
       host.innerHTML = Theory.drawBoard({ lo, hi, notes, activeStrings: active });
@@ -1422,12 +1601,14 @@ function render() {
   const song = isSongSeg(seg), board = isBoardSeg(seg);
   $('session').classList.toggle('song', song);
   $('session').classList.toggle('board', board);
+  $('session').classList.toggle('prog', seg.kind === 'prog');
   const itemCount = S.routine.items.length;
-  const kindLabel = song ? 'Song' : seg.kind === 'scale' ? 'Scale' : (seg.kind === 'noteFind' || seg.kind === 'callResp') ? 'Drill' : board ? 'Triads' : 'Exercise';
+  const kindLabel = song ? 'Song' : seg.kind === 'scale' ? 'Scale' : seg.kind === 'prog' ? 'Backing track' : (seg.kind === 'noteFind' || seg.kind === 'callResp') ? 'Drill' : board ? 'Triads' : 'Exercise';
   $('s-progress').textContent = `${kindLabel} · ${seg.item + 1} of ${itemCount}`;
   $('s-name').textContent = seg.name;
   const step = seg.ladder ? ` · step ${seg.ladder.k}/${seg.ladder.n}` : '';
   if (seg.kind === 'scale') $('s-sub').textContent = `Position ${seg.p}${seg.all ? ' of 5' : ''} · ${seg.bpm} BPM`;
+  else if (seg.kind === 'prog') $('s-sub').textContent = `${seg.feel === 'shuffle' ? 'Shuffle' : 'Straight'} · ${seg.bpm} BPM · ${capFirst(PROG_MODES[seg.mode])}${seg.mode === 'tones' ? ' · ' + Theory.noteName(seg.key) + ' ' + Theory.SCALES[seg.scale].name + ', pos ' + seg.p : ''}`;
   else if (seg.kind === 'noteFind') $('s-sub').textContent = `Frets 0–${seg.maxFret} · ${seg.bpm} BPM`;
   else if (seg.kind === 'callResp') $('s-sub').textContent = `${seg.title} · position ${seg.p} · ${seg.bpm} BPM`;
   else if (board) $('s-sub').textContent = `${Theory.STRING_SETS[seg.set].label} strings · ${seg.bpm} BPM`;
@@ -1630,13 +1811,17 @@ function defaultSongLadder() {
   return { start: 60, end: 100, step: 10, mode: 'loops', amount: 2, breakSec: 3 };
 }
 
-const isBoardItem = it => it && ['scale', 'triad', 'noteFind', 'callResp'].includes(it.type);
+const isBoardItem = it => it && ['scale', 'triad', 'noteFind', 'callResp', 'prog'].includes(it.type);
 const capFirst = t => t.charAt(0).toUpperCase() + t.slice(1);
 
 function itemName(it) {
   if (it.type === 'scale') {
     const sc = Theory.SCALES[it.scale] || Theory.SCALES.minPent;
     return `🎼 ${Theory.noteName(num(it.key, 9))} ${sc.name}`;
+  }
+  if (it.type === 'prog') {
+    const pr = Theory.PROGRESSIONS[it.prog] || Theory.PROGRESSIONS.rock;
+    return `🥁 ${pr.short} in ${Theory.noteName(num(it.key, 9))}${pr.minor ? ' minor' : ''} – ${PROG_MODES[it.mode] || 'play along'}`;
   }
   if (it.type === 'noteFind') {
     const ks = Array.isArray(it.keys) && it.keys.length ? it.keys : NATURALS;
@@ -1716,6 +1901,29 @@ function boardItemFields(it, i) {
     ${quizTimingFields(it, i, sel, numF, opt, oneToFour)}`;
     return h + `<div class="muted sum" id="songSum${i}">${esc(itemSummary(it))}</div>`;
   }
+  if (it.type === 'prog') {
+    const pr = Theory.PROGRESSIONS[it.prog] || Theory.PROGRESSIONS.rock;
+    h += keyCircle(i, [Theory.pcOf(num(it.key, 9))], false);
+    if (pr.minor) h += `<p class="muted" style="text-align:center;margin-top:-4px">The key is the minor chord the progression starts on.</p>`;
+    h += sel('prog', 'Progression', Theory.PROG_ORDER.map(id => opt(id, it.prog, Theory.PROGRESSIONS[id].name)).join(''));
+    h += `<div class="inline-fields">
+      ${sel('feel', 'Feel', opt('straight', it.feel, 'Straight') + opt('shuffle', it.feel, 'Shuffle'))}
+      ${numF('bpm', 'BPM', it.bpm)}
+    </div>
+    <div class="inline-fields">
+      ${pr.oneBar ? `<label class="field"><span>Bars per chord</span><div class="fixed">1 (always)</div></label>` : sel('barsPer', 'Bars per chord', [1, 2, 4].map(n => opt(n, it.barsPer, n)).join(''))}
+      ${numF('reps', 'Times through', it.reps)}
+    </div>`;
+    if (it.mode === 'tones') {
+      h += `<div class="inline-fields">
+        ${sel('scale', 'Scale', Theory.SCALE_ORDER.map(id => opt(id, it.scale || pr.scale, capFirst(Theory.SCALES[id].name))).join(''))}
+        ${sel('p', 'Position', [1, 2, 3, 4, 5].map(n => opt(n, it.p, n)).join(''))}
+      </div>`;
+    } else if (it.mode === 'triads') {
+      h += sel('strings', 'Strings', Object.keys(Theory.STRING_SETS).map(k => opt(k, it.strings, Theory.STRING_SETS[k].label)).join(''));
+    }
+    return h + `<div class="muted sum" id="songSum${i}">${esc(itemSummary(it))}</div>`;
+  }
   if (it.type === 'callResp') {
     h += keyCircle(i, [Theory.pcOf(num(it.key, 9))], false);
     const lens = (from, to, cur) => { let o = ''; for (let n = from; n <= to; n++) o += opt(n, cur, n + ' notes'); return o; };
@@ -1767,6 +1975,13 @@ function boardItemFields(it, i) {
 }
 
 function boardSummary(it) {
+  if (it.type === 'prog') {
+    const seg = progSegments(it, 0, 0)[0];
+    const seq = seg.chords.map(c => c.name).join(' ');
+    const nums = seg.chords.map(c => c.num).join('–');
+    const per = seg.pr.oneBar ? '1 bar each' : `${seg.bpc} bar${seg.bpc === 1 ? '' : 's'} per chord`;
+    return `Chords: ${seq}  (${nums}). ${per}, ${timesText(seg.reps).replace('once', 'once through').replace(' times', ' times through')} — about ${fmtShort(seg.duration)}.`;
+  }
   if (it.type === 'noteFind') {
     const seg = noteFindSegments(it, 0, 0)[0];
     const q = it.mode === 'every' ? '"Find every…"' : it.mode === 'string' ? '"…on the … string"' : 'a mix of both kinds of';
@@ -1943,7 +2158,7 @@ $('view').addEventListener('change', e => {
   if (draft && el.dataset.f && el.type === 'checkbox') updateDraftField(el);
   if (draft && el.dataset.f && el.tagName === 'SELECT') {
     updateDraftField(el);
-    if (/mode$|^b\.(scale|quality|p|len|timing)$/.test(el.dataset.f)) {   // redraw to show the converted number / new name
+    if (/mode$|^b\.(scale|quality|p|len|timing|prog)$/.test(el.dataset.f)) {   // redraw to show the converted number / new name
       const y = window.scrollY; renderRoutineEditor(); window.scrollTo(0, y);
     }
   }
@@ -1961,8 +2176,13 @@ function updateDraftField(el) {
       // Scale guide and triad settings
       const k = f.slice(2);
       // Seconds and bars each keep their own numbers, so switching back and forth loses nothing
+      if (k === 'prog' && it.type === 'prog' && el.value !== it.prog) {
+        // a new progression brings its own sensible tempo and scale
+        const pr = Theory.PROGRESSIONS[el.value];
+        if (pr) { it.bpm = pr.bpm; it.scale = pr.scale; if (pr.oneBar && num(it.reps, 4) > 3) it.reps = 2; }
+      }
       if (el.type === 'checkbox') it[k] = el.checked;
-      else if (['bpm', 'rounds', 'posBreak', 'prompts', 'findBars', 'revealBars', 'bars', 'p', 'len', 'maxLen', 'maxFret', 'findSecs', 'revealSecs'].includes(k)) it[k] = Math.max(k === 'posBreak' ? 0 : 1, num(el.value, it[k]));
+      else if (['bpm', 'rounds', 'posBreak', 'prompts', 'findBars', 'revealBars', 'bars', 'p', 'len', 'maxLen', 'maxFret', 'findSecs', 'revealSecs', 'barsPer', 'reps'].includes(k)) it[k] = Math.max(k === 'posBreak' ? 0 : 1, num(el.value, it[k]));
       else if (k === 'positions') it[k] = el.value === 'all' ? 'all' : num(el.value, 1);
       else it[k] = el.value;
     }
@@ -2052,7 +2272,7 @@ $('view').addEventListener('click', e => {
   }
   if (act === 'key') {
     const it = draft.items[i], pc = +b.dataset.pc;
-    if (it.type === 'scale' || it.type === 'callResp') it.key = pc;
+    if (it.type === 'scale' || it.type === 'callResp' || it.type === 'prog') it.key = pc;
     else {
       const ks = itemKeys(it), at = ks.indexOf(pc);
       if (at >= 0) {
@@ -2081,6 +2301,8 @@ function addToDraft(val) {
       draft.items.push({ type: 'noteFind', keys: NATURALS.slice(), strs: [0, 1, 2, 3, 4, 5], mode: 'mix', maxFret: 12, bpm: 70, prompts: 10, timing: 'secs', findSecs: 5, revealSecs: 3, findBars: 2, revealBars: 1 });
     } else if (val === 'drill:call') {
       draft.items.push({ type: 'callResp', key: 9, scale: 'minPent', p: 1, bpm: 70, prompts: 10, len: 3, maxLen: 6, labels: 'degrees' });
+    } else if (val.startsWith('prog:')) {
+      draft.items.push({ type: 'prog', mode: val.slice(5), key: 9, prog: 'rock', feel: 'straight', bpm: 90, barsPer: 2, reps: 4, scale: 'majPent', p: 1, strings: 'gbe' });
     } else if (val === 'triad:walk') {
       draft.items.push({ type: 'triad', mode: 'walk', keys: [0], quality: 'major', strings: 'gbe', bpm: 70, bars: 2, sayNames: true, shuffle: false, labels: 'degrees' });
     } else if (val === 'triad:quiz') {
@@ -2153,7 +2375,11 @@ function renderPickerList() {
          <button class="pk-row" data-add="triad:quiz"><b>🔺 Name it, find it</b><span>Test yourself: the voice calls a triad, then it's shown</span></button>`;
   } else if (pickerKind === 'drill') {
     h = `<button class="pk-row" data-add="drill:note"><b>🎯 Note finder</b><span>"Find every C" or "G on the A string" — then the answer appears</span></button>
-         <button class="pk-row" data-add="drill:call"><b>👂 Call and response</b><span>Roadie plays a short phrase, you play it back, then it's shown</span></button>`;
+         <button class="pk-row" data-add="drill:call"><b>👂 Call and response</b><span>Roadie plays a short phrase, you play it back, then it's shown</span></button>
+         <div class="pk-group">Backing tracks (drums and bass)</div>
+         <button class="pk-row" data-add="prog:play"><b>🥁 Play along</b><span>Strum the power chords of a progression with the band</span></button>
+         <button class="pk-row" data-add="prog:tones"><b>🎯 Chord tones</b><span>Improvise in a scale position — each chord's notes light up</span></button>
+         <button class="pk-row" data-add="prog:triads"><b>🔺 Triads over the chords</b><span>Follow nearby triad shapes as the chords change</span></button>`;
   } else if (pickerKind === 'song') {
     if (!songs.length) h = '<div class="empty">No songs yet. Import one in the Songs tab first.</div>';
     for (const s of songs) {
@@ -2608,7 +2834,7 @@ function renderSettings() {
       <button class="btn wide" id="importBtn">Import backup</button>
       <input type="file" id="importFile" accept=".json,application/json" hidden>
     </div>
-    <p class="muted" style="text-align:center;margin-top:24px">Roadie · Phase 4A</p>`;
+    <p class="muted" style="text-align:center;margin-top:24px">Roadie · Phase 4</p>`;
   fillVoiceSelect($('voiceSel'));
 
   v.querySelectorAll('[data-s]').forEach(el => {

@@ -325,7 +325,70 @@ const Theory = (() => {
     'Slow and clean beats fast and sloppy. Speed comes from accuracy.'
   ];
 
+  /* ---------- Chord progressions ---------- */
+  // Each chord: semitones above the key's root, major/minor, and its Roman numeral
+  const CH = {
+    I: { iv: 0, q: 'major', num: 'I' }, IV: { iv: 5, q: 'major', num: 'IV' }, V: { iv: 7, q: 'major', num: 'V' },
+    i: { iv: 0, q: 'minor', num: 'i' }, bVII: { iv: 10, q: 'major', num: '♭VII' }, bVI: { iv: 8, q: 'major', num: '♭VI' }
+  };
+  const PROGRESSIONS = {
+    rock:  { name: 'Classic rock (I–IV–V)', short: 'Classic rock', chords: ['I', 'IV', 'V', 'IV'], minor: false, scale: 'majPent', bpm: 90 },
+    blues: { name: '12-bar blues', short: '12-bar blues', chords: ['I', 'I', 'I', 'I', 'IV', 'IV', 'I', 'I', 'V', 'IV', 'I', 'V'], minor: false, oneBar: true, scale: 'minPent', bpm: 80 },
+    minor: { name: 'Minor rock (i–♭VII–♭VI)', short: 'Minor rock', chords: ['i', 'bVII', 'bVI', 'bVII'], minor: true, scale: 'minor', bpm: 90 }
+  };
+  const PROG_ORDER = ['rock', 'blues', 'minor'];
+
+  function progChords(keyPc, progId) {
+    const pr = PROGRESSIONS[progId] || PROGRESSIONS.rock;
+    return pr.chords.map(c => {
+      const ch = CH[c], root = pcOf(keyPc + ch.iv);
+      return { root, quality: ch.q, num: ch.num, name: noteName(root) + (ch.q === 'minor' ? 'm' : ''), spoken: spokenNote(root) + (ch.q === 'minor' ? ' minor' : '') };
+    });
+  }
+  // The different chords of a progression, in order of first appearance (for summaries)
+  function progChordList(keyPc, progId) {
+    const seen = new Set(), out = [];
+    for (const c of progChords(keyPc, progId)) if (!seen.has(c.name)) { seen.add(c.name); out.push(c); }
+    return out;
+  }
+
+  // Power chord (root, 5th, octave) with its root on the low E or A string —
+  // whichever keeps the hand closest to where it was
+  function powerChord(rootPc, prevFret) {
+    const opts = [0, 1].map(s => {
+      let f = pcOf(rootPc - OPEN[s]);
+      return { s, f };
+    });
+    const target = prevFret == null ? 5 : prevFret;
+    opts.sort((a, b) => Math.abs(a.f - target) - Math.abs(b.f - target) || a.s - b.s);
+    const { s, f } = opts[0];
+    return {
+      fret: f,
+      notes: [
+        { s, f, midi: OPEN[s] + f, iv: 0 },
+        { s: s + 1, f: f + 2, midi: OPEN[s + 1] + f + 2, iv: 7 },
+        { s: s + 2, f: f + 2, midi: OPEN[s + 2] + f + 2, iv: 0 }
+      ]
+    };
+  }
+
+  // Triad shapes that stay in one area of the neck (around the first chord's shape),
+  // so the hand barely moves and the progression loops back smoothly
+  function triadPath(chords, setId, around) {
+    const centre = sh => (sh.minF + sh.maxF) / 2;
+    const pick = (c, target) => {
+      const shapes = triadShapes(c.root, c.quality, setId).filter(sh => sh.maxF <= 15);
+      let best = shapes[0];
+      for (const sh of shapes) if (Math.abs(centre(sh) - target) < Math.abs(centre(best) - target)) best = sh;
+      return best;
+    };
+    const first = pick(chords[0], around == null ? 7 : around);
+    const anchor = centre(first);
+    return chords.map((c, k) => k === 0 ? first : pick(c, anchor));
+  }
+
   return {
+    PROGRESSIONS, PROG_ORDER, progChords, progChordList, powerChord, triadPath,
     STRING_NAMES, STRING_SHORT, notePlaces, makePhrases, TIPS,
     OPEN, MAX_FRET, TRIAD_MAX, NOTE_NAMES, CIRCLE, DEGREE, SCALES, SCALE_ORDER, STRING_SETS, INV_NAMES, INV_SHORT,
     pcOf, noteName, spokenNote, position, scalePath, wholeNeck,
