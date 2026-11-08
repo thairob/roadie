@@ -117,6 +117,8 @@ let ctx = null, master = null, noiseBuf = null;
 
 function ensureAudio() {
   // Must be called from inside a tap so iOS lets audio start.
+  // Play through the silent switch on newer iOS (set before audio starts)
+  try { if (navigator.audioSession && navigator.audioSession.type !== 'playback') navigator.audioSession.type = 'playback'; } catch (e) {}
   if (!ctx) {
     const AC = window.AudioContext || window.webkitAudioContext;
     ctx = new AC();
@@ -127,8 +129,6 @@ function ensureAudio() {
     const d = noiseBuf.getChannelData(0);
     for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
   }
-  // Play through the silent switch on newer iOS (Safari 17+)
-  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
   if (ctx.state !== 'running') ctx.resume();
   // A tiny silent blip fully unlocks audio on iOS
   const o = ctx.createOscillator(), g = ctx.createGain();
@@ -350,7 +350,9 @@ const S = {
   raf: 0, ticker: 0
 };
 const $ = id => document.getElementById(id);
-const now = () => ctx ? ctx.currentTime : performance.now() / 1000;
+// Session timing uses the phone's normal clock. The audio clock can freeze on iPhone
+// (for example while the voice is talking), so it is only used to schedule clicks.
+const now = () => performance.now() / 1000;
 
 function startSession(routineId) {
   const routine = routines.find(r => r.id === routineId);
@@ -378,7 +380,7 @@ function enterBreak(i) {
   const seg = S.segs[i];
   S.breakEnd = now() + Math.max(1, seg.breakBefore);
   S.speechDone = false;
-  S.breakStartedAt = now();
+  S.speechStartedAt = now();
   const text = announcement(seg);
   speak(text, () => { S.speechDone = true; });
   render();
@@ -390,16 +392,17 @@ function enterCountIn(remaining) {
   S.phase = 'countin';
   S.segRemaining = remaining;
   S.cue30Done = remaining <= 31;
-  S.countStart = ctx.currentTime + 0.15;
+  if (ctx.state !== 'running') { try { ctx.resume(); } catch (e) {} }
+  S.countStart = now() + 0.15;
   S.playStart = S.countStart + 4 * 60 / seg.bpm;
-  Metro.start(seg.bpm, S.countStart, 4);
+  Metro.start(seg.bpm, ctx.currentTime + 0.15, 4);
   render();
 }
 
 function currentRemaining() {
   const seg = S.segs[S.i];
   if (!seg) return 0;
-  if (S.phase === 'play') return S.segRemaining - (ctx.currentTime - S.playStart);
+  if (S.phase === 'play') return S.segRemaining - (now() - S.playStart);
   if (S.phase === 'countin') return S.segRemaining;
   if (S.phase === 'paused' && S.pausedFrom) return S.pausedFrom.rem;
   return seg.duration;
@@ -409,10 +412,17 @@ function tick() {
   if (!S.active) return;
   Metro.poll();
   const t = now();
+  if (ctx && ctx.state !== 'running' && (S.phase === 'countin' || S.phase === 'play') && t - (S.lastResume || 0) > 1) {
+    S.lastResume = t;
+    try { ctx.resume(); } catch (e) {}
+  }
   if (S.phase === 'break') {
     // Wait for both the break timer and the voice cue, so we never talk over the count-in
-    const speechTimeout = t > S.breakEnd + 20;
-    if (t >= S.breakEnd && (S.speechDone || speechTimeout)) {
+    // Backups in case iPhone never reports that the voice finished
+    const speechSilent = 'speechSynthesis' in window && !speechSynthesis.speaking && !speechSynthesis.pending
+                         && t > S.speechStartedAt + 1.5;
+    const speechTimeout = t > S.breakEnd + 8;
+    if (t >= S.breakEnd && (S.speechDone || speechSilent || speechTimeout)) {
       enterCountIn(S.segs[S.i].duration);
       return;
     }
@@ -582,7 +592,7 @@ function renderLive() {
     html = `${left > 0 ? Math.ceil(left) : '…'}<span class="lbl">get ready · ${fmtClock(seg.duration)}</span>`;
   } else if (S.phase === 'countin') {
     const interval = 60 / seg.bpm;
-    const n = Math.floor((ctx.currentTime - S.countStart) / interval);
+    const n = Math.floor((now() - S.countStart) / interval);
     cls = 'countin';
     html = n < 0 ? '4' : String(clamp(4 - n, 1, 4));
     html += '<span class="lbl">count-in</span>';
