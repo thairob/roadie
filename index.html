@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Roadie">
+  <meta name="theme-color" content="#0b0b0d">
+  <title>Roadie</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="icon" type="image/png" href="icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Setup screens (routines, exercises, settings) -->
+  <div id="app">
+    <main id="view"></main>
+    <nav id="tabs">
+      <button data-tab="routines">Routines</button>
+      <button data-tab="exercises">Exercises</button>
+      <button data-tab="settings">Settings</button>
+    </nav>
+  </div>
+
+  <!-- Session screen -->
+  <div id="session" hidden>
+    <div id="flash"></div>
+    <div id="s-top">
+      <div id="s-progress"></div>
+      <div id="s-name"></div>
+      <div id="s-sub"></div>
+    </div>
+    <div id="s-big"></div>
+    <div id="s-beats"></div>
+    <div id="s-next"></div>
+    <div id="s-hint-left">⟲ restart<br><small>hold: previous</small></div>
+    <div id="s-hint-center">tap: pause</div>
+    <div id="s-hint-right">skip ⏭</div>
+
+    <!-- The three tap zones sit on top of everything above -->
+    <div id="zones"></div>
+
+    <div id="undo" hidden></div>
+
+    <div id="paused" hidden>
+      <div id="paused-msg"></div>
+      <button id="btn-resume" class="huge">Resume</button>
+      <button id="btn-end" class="ghost">End session</button>
+    </div>
+
+    <div id="done" hidden>
+      <div class="done-title">Session complete</div>
+      <div id="done-sub"></div>
+      <button id="btn-done" class="huge">Back to routines</button>
+    </div>
+
+    <div id="rotate">
+      <div>↻</div>
+      <p>Rotate your phone sideways</p>
+    </div>
+  </div>
+
+  <div id="toast" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
