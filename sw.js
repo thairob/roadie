@@ -1,7 +1,7 @@
 /* Roadie service worker — makes the app work offline.
    IMPORTANT: whenever you upload new versions of the app files,
    change the version number below (v1 → v2 → v3 …) so phones pick up the update. */
-const CACHE = 'roadie-v5';
+const CACHE = 'roadie-v7';
 const FILES = [
   './',
   './index.html',

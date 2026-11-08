@@ -677,6 +677,8 @@ function startSongPlay() {
   S.phase = 'play';
   S.playStart = now();
   S.songEnded = false; S.lastLoopAt = now();
+  S.loopStartedAt = now(); S.loopStartPos = S.songStartPos;
+  S.seekTarget = null; S.seekTries = 0;
   songEl.defaultPlaybackRate = seg.rate;
   songEl.playbackRate = seg.rate;
   setPreservePitch();
@@ -685,7 +687,7 @@ function startSongPlay() {
   const fix = () => {
     songEl.removeEventListener('playing', fix);
     // Some iPhones ignore a jump made before playback; make it again once playing
-    if (Math.abs(songEl.currentTime - want) > 0.4 && S.phase === 'play') seekSong(want);
+    if (Math.abs(songEl.currentTime - want) > 0.4 && S.phase === 'play') sessionSeek(want);
     songEl.playbackRate = seg.rate;
   };
   songEl.addEventListener('playing', fix);
@@ -695,14 +697,27 @@ function startSongPlay() {
 
 songEl.addEventListener('ended', () => { if (S.active && S.phase === 'play') S.songEnded = true; });
 
+// Jump the song during a session. iPhone can take a moment to actually get there,
+// so remember the target and don't judge the position until the jump has landed.
+function sessionSeek(target, resetTries) {
+  if (resetTries !== false) S.seekTries = 0;
+  S.seekTarget = target;
+  S.seekIssuedAt = now();
+  seekSong(target);
+  if (S.phase === 'play' && songEl.paused) {
+    try { const p = songEl.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+  }
+}
+
 function songLoopDone() {
   const seg = curSeg();
   S.songEnded = false;
   S.lastLoopAt = now();
   S.loop++;
   if (seg.mode === 'loops' && S.loop >= seg.amount) { endSegment(); return; }
-  seekSong(seg.start);
-  if (songEl.paused) { try { const p = songEl.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {} }
+  S.loopStartedAt = now();
+  S.loopStartPos = seg.start;
+  sessionSeek(seg.start);
 }
 
 function endSegment() {
@@ -776,10 +791,36 @@ function tick() {
     }
   } else if (S.phase === 'play') {
     if (isSongSeg(seg)) {
-      const pos = songEl.currentTime;
-      const atEnd = S.songEnded || (pos >= seg.end - 0.04 && t - S.lastLoopAt > 0.3);
-      if (atEnd) { songLoopDone(); if (!S.active || S.phase !== 'play') return; }
       if (seg.mode === 'time' && currentRemaining() <= 0) { endSegment(); return; }
+      const pos = songEl.currentTime;
+      if (S.seekTarget != null) {
+        // Wait for a jump to land before checking for the end of the section
+        if (Math.abs(pos - S.seekTarget) < 0.6) {
+          S.seekTarget = null;
+        } else if (t - S.seekIssuedAt > 1.5) {
+          // The jump didn't take: try again a couple of times, then trust the player
+          if (S.seekTries < 3) { S.seekTries++; sessionSeek(S.seekTarget, false); }
+          else S.seekTarget = null;
+        }
+        renderLive();
+        return;
+      }
+      if (pos < seg.start - 0.5 || pos > seg.end + 1.5) {
+        // Playing outside the section (iPhone started in the wrong place): go to the start, don't count a loop
+        S.loopStartedAt = t; S.loopStartPos = seg.start;
+        sessionSeek(seg.start);
+      } else if (S.songEnded || pos >= seg.end - 0.04) {
+        // Only count a loop if enough of it was really played
+        const needed = 0.5 * Math.max(0, seg.end - S.loopStartPos) / seg.rate;
+        if (t - S.loopStartedAt >= needed) {
+          songLoopDone();
+          if (!S.active || S.phase !== 'play') return;
+        } else {
+          S.songEnded = false;
+          S.loopStartedAt = t; S.loopStartPos = seg.start;
+          sessionSeek(seg.start);
+        }
+      }
     } else if (currentRemaining() <= 0) {
       endSegment();
       return;
@@ -897,7 +938,9 @@ function rewindSong() {
   if (!isSongSeg(seg)) return;
   const amt = seg.rewind;
   if (S.phase === 'play') {
-    seekSong(Math.max(seg.start, songEl.currentTime - amt));   // never wraps, so the loop count is unchanged
+    // never goes before the section start, so the loop count is unchanged
+    const from = S.seekTarget != null ? S.seekTarget : songEl.currentTime;
+    sessionSeek(Math.max(seg.start, from - amt));
   } else if (S.phase === 'paused' && S.pausedFrom && S.pausedFrom.phase !== 'break') {
     S.pausedFrom.pos = Math.max(seg.start, S.pausedFrom.pos - amt);
     render();
@@ -1157,6 +1200,36 @@ function itemName(it) {
   return ex ? ex.name : (it.name || 'Missing exercise');
 }
 
+function sectionLen(it) {
+  const sec = findSection(findSong(it.songId), it.sectionId);
+  return sec ? Math.max(0.5, sec.end - sec.start) : 30;
+}
+const timesText = n => n === 1 ? 'once' : n + ' times';
+
+// Plain-English description of what a song item will do
+function songSummary(it) {
+  const sec = findSection(findSong(it.songId), it.sectionId);
+  if (!sec) return '';
+  const len = sectionLen(it);
+  if (it.ladder) {
+    const l = it.ladder, steps = ladderSteps(l, 25, 150);
+    const amt = Math.max(1, Math.round(num(l.amount, 2)));
+    if (l.mode === 'time') {
+      return `Each step loops ${sec.name} for ${fmtClock(amt)}. ${steps.length} steps, about ${fmtShort(steps.length * amt)} of playing.`;
+    }
+    const total = steps.reduce((t, p) => t + amt * len / (p / 100), 0);
+    return `Each step plays ${sec.name} ${timesText(amt)}. ${steps.length} steps, about ${fmtShort(total)} of playing.`;
+  }
+  const rate = clamp(num(it.speed, 100), 25, 150) / 100;
+  const amt = Math.max(1, Math.round(num(it.amount, 4)));
+  const loopLen = len / rate;
+  if (it.mode === 'time') {
+    const times = amt / loopLen;
+    return `Keeps looping ${sec.name} for ${fmtClock(amt)} — about ${times < 1 ? 'part of it once' : timesText(Math.round(times))}.`;
+  }
+  return `Plays ${sec.name} ${timesText(amt)} — about ${fmtClock(amt * loopLen)}.`;
+}
+
 function ladderInfoText(it) {
   if (isSongItem(it)) return `${ladderSteps(it.ladder, 25, 150).length} steps: ${ladderSteps(it.ladder, 25, 150).map(p => p + '%').join(' → ')}`;
   const st = ladderSteps(it.ladder);
@@ -1197,9 +1270,10 @@ function renderRoutineEditor() {
           <label class="field"><span>Play for</span><input type="number" inputmode="numeric" data-i="${i}" data-f="amount" value="${esc(it.amount)}"></label>
           <label class="field"><span>Measured in</span><select data-i="${i}" data-f="mode">
             <option value="loops" ${it.mode !== 'time' ? 'selected' : ''}>loops</option>
-            <option value="time" ${it.mode === 'time' ? 'selected' : ''}>seconds</option>
+            <option value="time" ${it.mode === 'time' ? 'selected' : ''}>secs</option>
           </select></label>
         </div>
+        <div class="muted sum" id="songSum${i}">${esc(songSummary(it))}</div>
         ${rewindSel}
         <button class="btn small" data-act="ladderOn" data-i="${i}">+ Speed ladder</button>`;
       } else {
@@ -1215,11 +1289,12 @@ function renderRoutineEditor() {
             <label class="field"><span>Each step</span><input type="number" inputmode="numeric" data-i="${i}" data-f="ladder.amount" value="${esc(l.amount)}"></label>
             <label class="field"><span>Measured in</span><select data-i="${i}" data-f="ladder.mode">
               <option value="loops" ${l.mode !== 'time' ? 'selected' : ''}>loops</option>
-              <option value="time" ${l.mode === 'time' ? 'selected' : ''}>seconds</option>
+              <option value="time" ${l.mode === 'time' ? 'selected' : ''}>secs</option>
             </select></label>
             <label class="field"><span>Break (s)</span><input type="number" inputmode="numeric" data-i="${i}" data-f="ladder.breakSec" value="${esc(l.breakSec)}"></label>
           </div>
           <div class="muted" id="ladderInfo${i}">${ladderInfoText(it)}</div>
+          <div class="muted sum" id="songSum${i}">${esc(songSummary(it))}</div>
         </div>
         ${rewindSel}`;
       }
@@ -1243,8 +1318,8 @@ function renderRoutineEditor() {
         <div class="inline-fields">
           <label class="field"><span>Each step lasts</span><input type="number" inputmode="numeric" data-i="${i}" data-f="ladder.amount" value="${esc(l.amount)}"></label>
           <label class="field"><span>Measured in</span><select data-i="${i}" data-f="ladder.mode">
-            <option value="time" ${l.mode === 'time' ? 'selected' : ''}>seconds</option>
-            <option value="bars" ${l.mode === 'bars' ? 'selected' : ''}>bars (loops)</option>
+            <option value="time" ${l.mode === 'time' ? 'selected' : ''}>secs</option>
+            <option value="bars" ${l.mode === 'bars' ? 'selected' : ''}>bars</option>
           </select></label>
           <label class="field"><span>Break (s)</span><input type="number" inputmode="numeric" data-i="${i}" data-f="ladder.breakSec" value="${esc(l.breakSec)}"></label>
         </div>
@@ -1271,7 +1346,12 @@ $('view').addEventListener('input', e => {
 });
 $('view').addEventListener('change', e => {
   const el = e.target;
-  if (draft && el.dataset.f && el.tagName === 'SELECT') updateDraftField(el);
+  if (draft && el.dataset.f && el.tagName === 'SELECT') {
+    updateDraftField(el);
+    if (/mode$/.test(el.dataset.f)) {   // the number was converted, so redraw to show it
+      const y = window.scrollY; renderRoutineEditor(); window.scrollTo(0, y);
+    }
+  }
 });
 
 function updateDraftField(el) {
@@ -1285,7 +1365,13 @@ function updateDraftField(el) {
     if (f === 'bpm') it.bpm = clamp(num(el.value, 80), 20, 400);
     else if (f === 'speed') it.speed = clamp(num(el.value, 100), 25, 150);
     else if (f === 'amount') it.amount = Math.max(1, Math.round(num(el.value, 4)));
-    else if (f === 'mode') it.mode = el.value;
+    else if (f === 'mode') {
+      // Switching loops <-> seconds converts the number so the length stays about the same
+      const len = sectionLen(it), rate = clamp(num(it.speed, 100), 25, 150) / 100;
+      if (el.value === 'time' && it.mode !== 'time') it.amount = Math.max(5, Math.round(num(it.amount, 4) * len / rate));
+      if (el.value === 'loops' && it.mode === 'time') it.amount = Math.max(1, Math.round(num(it.amount, 60) * rate / len));
+      it.mode = el.value;
+    }
     else if (f === 'rewind') it.rewind = num(el.value, 15);
     else if (f === 'min' || f === 'sec') {
       const box = el.closest('.item');
@@ -1294,10 +1380,26 @@ function updateDraftField(el) {
       it.duration = Math.max(5, m * 60 + s);
     } else if (f.startsWith('ladder.')) {
       const k = f.slice(7);
+      if (k === 'mode' && el.value !== it.ladder.mode) {
+        const l = it.ladder, amt = num(l.amount, 1);
+        if (isSongItem(it)) {
+          const len = sectionLen(it);
+          if (el.value === 'time') l.amount = Math.max(5, Math.round(amt * len));
+          else l.amount = Math.max(1, Math.round(amt / len));
+        } else {
+          const bpm = Math.max(20, num(l.start, 80)), barSec = settings.beatsPerBar * 60 / bpm;
+          if (el.value === 'bars') l.amount = Math.max(1, Math.round(amt / barSec));
+          else l.amount = Math.max(5, Math.round(amt * barSec));
+        }
+      }
       it.ladder[k] = k === 'mode' ? el.value : num(el.value, it.ladder[k]);
       const info = document.getElementById('ladderInfo' + i);
       if (info) info.textContent = ladderInfoText(it);
     }
+  }
+  if (i !== undefined) {
+    const sum = document.getElementById('songSum' + i);
+    if (sum && draft.items[+i]) sum.textContent = songSummary(draft.items[+i]);
   }
   const tt = $('totalTime');
   if (tt) tt.textContent = fmtShort(routineTotalSec(draft));
