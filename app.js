@@ -76,6 +76,7 @@ const DEFAULT_SETTINGS = {
   voiceURI: '',
   voiceRate: 1,
   firstBreak: 5,
+  surprise: null,    // last choices on the Surprise me screen
   tips: true,        // one-sentence theory tips in the breaks between items
   tipIdx: 0
 };
@@ -912,7 +913,8 @@ function clicksNeededNow() {
 }
 
 async function startSession(routineId) {
-  const routine = routines.find(r => r.id === routineId);
+  // a saved routine (by id) or a one-off plan from Surprise me
+  const routine = typeof routineId === 'object' ? routineId : routines.find(r => r.id === routineId);
   if (!routine || !routine.items.length) { toast('Add something to this routine first'); return; }
   // Check every song still has its audio on this phone
   for (const it of routine.items) {
@@ -1435,12 +1437,13 @@ function showProgBoard(seg, step, playing, force) {
     Board.key = key;
   }
   // The big chord name, its number, and a countdown to the next change
+  // Roman numerals are the big thing to look at, so they're learned; the letter is the small reminder
   let html;
-  if (!playing) html = `<span class="cap-dim">First chord:</span> <span class="ch">${chord.name}</span><span class="nm">${chord.num}</span>`;
+  if (!playing) html = `<span class="cap-dim">First chord:</span> <span class="ch">${chord.num}</span><span class="nm">${chord.name}</span>`;
   else {
-    html = `<span class="ch">${chord.name}</span><span class="nm">${chord.num}</span>`;
-    if (warn) html += `<span class="nx">→ ${next.name} in ${left}</span>`;
-    else if (!lastChord) html += `<span class="nx dim">next ${next.name}</span>`;
+    html = `<span class="ch">${chord.num}</span><span class="nm">${chord.name}</span>`;
+    if (warn) html += `<span class="nx">→ ${next.num} in ${left}</span>`;
+    else if (!lastChord) html += `<span class="nx dim">next ${next.num}</span>`;
   }
   const cap = $('s-caption');
   if (cap.innerHTML !== html) cap.innerHTML = html;
@@ -1775,7 +1778,8 @@ document.querySelectorAll('#tabs button').forEach(b => b.addEventListener('click
 /* ---------- Routines list ---------- */
 function renderRoutines() {
   const v = $('view');
-  let html = `<h1><span class="logo">Roadie</span></h1>`;
+  let html = `<h1><span class="logo">Roadie</span></h1>
+    <button class="btn wide surprise" id="surpriseBtn">🎲 Surprise me</button>`;
   if (!routines.length) html += `<div class="empty">No routines yet.</div>`;
   for (const r of routines) {
     const n = r.items.length;
@@ -1795,6 +1799,7 @@ function renderRoutines() {
   v.querySelectorAll('[data-start]').forEach(b => b.addEventListener('click', () => startSession(b.dataset.start)));
   v.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => editRoutine(b.dataset.edit)));
   $('newRoutine').addEventListener('click', () => editRoutine(null));
+  $('surpriseBtn').addEventListener('click', () => renderSurprise(false));
 }
 
 /* ---------- Routine editor ---------- */
@@ -2421,6 +2426,192 @@ $('picker').addEventListener('click', e => {
   if (pickerKind === 'triad' || pickerKind === 'drill') closePicker();   // usually just one of these at a time
 });
 
+/* ---------- Surprise me (Phase 5) ---------- */
+const SURPRISE_KINDS = [
+  { id: 'exercise', label: '🎸 Warm-up exercises' },
+  { id: 'scale', label: '🎼 Scale guide' },
+  { id: 'triad', label: '🔺 Triads' },
+  { id: 'drill', label: '🎯 Note finder & call and response' },
+  { id: 'band', label: '🥁 Backing tracks' },
+  { id: 'song', label: '🎵 My songs' }
+];
+const COMMON_KEYS = [9, 4, 7, 2, 0];           // A, E, G, D, C — friendly guitar keys
+const rnd = a => a[Math.floor(Math.random() * a.length)];
+let surprisePlan = null;
+
+function surpriseChoices() {
+  const d = { mins: 20, kinds: { exercise: true, scale: true, triad: true, drill: true, band: true, song: true } };
+  const c = settings.surprise || {};
+  return { mins: c.mins || d.mins, kinds: Object.assign({}, d.kinds, c.kinds || {}) };
+}
+function songsWithAudio() { return songs.filter(x => audioIds.has(x.id) && x.sections.length); }
+
+// One item of a kind, sized to last roughly `target` seconds
+function surpriseItem(kind, target, used) {
+  if (kind === 'exercise') {
+    const pool = exercises.filter(e => !used.has('ex:' + e.id));
+    const ex = rnd(pool.length ? pool : exercises);
+    used.add('ex:' + ex.id);
+    return { exId: ex.id, name: ex.name, bpm: ex.bpm, duration: clamp(Math.round(target / 15) * 15, 45, 240), ladder: null };
+  }
+  if (kind === 'scale') {
+    const scale = rnd(['minPent', 'minPent', 'minPent', 'majPent', 'minBlues', 'minor', 'major', 'dorian', 'mixo']);
+    const key = rnd(COMMON_KEYS), p = 1 + Math.floor(Math.random() * 5), bpm = rnd([70, 75, 80, 85, 90]);
+    const n = Theory.position(key, scale, p).notes.length;
+    const rounds = clamp(Math.round(target * bpm / 60 / (2 * (n - 1))), 1, 6);
+    return { type: 'scale', key, scale, bpm, positions: p, rounds, posBreak: 4, labels: 'degrees', tones: true };
+  }
+  if (kind === 'triad') {
+    if (Math.random() < 0.5) {
+      return { type: 'triad', mode: 'walk', keys: [rnd(COMMON_KEYS)], quality: rnd(['major', 'minor']), strings: Math.random() < 0.7 ? 'gbe' : 'dgb', bpm: 70, bars: 2, sayNames: true, shuffle: false, labels: 'degrees' };
+    }
+    return { type: 'triad', mode: 'quiz', keys: COMMON_KEYS.slice(0, 4), quality: 'both', strings: 'gbe', bpm: 70, prompts: clamp(Math.round(target / 8), 4, 20), timing: 'secs', findSecs: 5, revealSecs: 3, findBars: 2, revealBars: 1, labels: 'degrees' };
+  }
+  if (kind === 'drill') {
+    if (Math.random() < 0.55) {
+      return { type: 'noteFind', keys: NATURALS.slice(), strs: [0, 1, 2, 3, 4, 5], mode: 'mix', maxFret: 12, bpm: 70, prompts: clamp(Math.round(target / 8), 4, 20), timing: 'secs', findSecs: 5, revealSecs: 3, findBars: 2, revealBars: 1 };
+    }
+    return { type: 'callResp', key: rnd(COMMON_KEYS), scale: rnd(['minPent', 'minPent', 'majPent']), p: 1, bpm: 70, prompts: clamp(Math.round(target / 12), 4, 15), len: 3, maxLen: 6, labels: 'degrees' };
+  }
+  if (kind === 'band') {
+    const prog = rnd(Theory.PROG_ORDER), pr = Theory.PROGRESSIONS[prog];
+    const it = { type: 'prog', mode: rnd(['play', 'play', 'tones', 'triads']), key: rnd(COMMON_KEYS), prog, feel: prog === 'blues' && Math.random() < 0.5 ? 'shuffle' : 'straight', bpm: pr.bpm, barsPer: 2, reps: 1, scale: pr.scale, p: 1, strings: 'gbe' };
+    const loop = progSegments(it, 0, 0)[0].duration;
+    it.reps = clamp(Math.round(target / loop), 1, 20);
+    return it;
+  }
+  if (kind === 'song') {
+    const all = [];
+    songsWithAudio().forEach(x => x.sections.forEach(sec => all.push({ song: x, sec })));
+    const fresh = all.filter(o => !used.has('song:' + o.sec.id));
+    const { song, sec } = rnd(fresh.length ? fresh : all);
+    used.add('song:' + sec.id);
+    return { type: 'song', songId: song.id, sectionId: sec.id, speed: 100, mode: 'time', amount: clamp(Math.round(target / 15) * 15, 60, 300), rewind: 15, ladder: null };
+  }
+  return null;
+}
+
+// Make one surprise item about `d` seconds longer (or shorter, if d is negative)
+function adjustSurpriseItem(it, d) {
+  if (!it.type) { it.duration = clamp(Math.round((it.duration + d) / 15) * 15, 45, 360); return; }
+  if (it.type === 'song') { it.amount = clamp(Math.round((it.amount + d) / 15) * 15, 60, 420); return; }
+  if (it.type === 'noteFind' || (it.type === 'triad' && it.mode === 'quiz')) { it.prompts = clamp(it.prompts + Math.round(d / 8), 4, 30); return; }
+  if (it.type === 'callResp') { it.prompts = clamp(it.prompts + Math.round(d / 12), 4, 20); return; }
+  if (it.type === 'scale') {
+    const n = Theory.position(it.key, it.scale, it.positions).notes.length;
+    it.rounds = clamp(it.rounds + Math.round(d * it.bpm / 60 / (2 * (n - 1))), 1, 8);
+    return;
+  }
+  if (it.type === 'prog') {
+    const loop = progSegments(Object.assign({}, it, { reps: 1 }), 0, 0)[0].duration;
+    it.reps = clamp(it.reps + Math.round(d / loop), 1, 20);
+  }
+}
+
+function buildSurprise(mins, kinds) {
+  const total = mins * 60, brk = 10;
+  let enabled = SURPRISE_KINDS.map(k => k.id).filter(id => kinds[id]);
+  if (!songsWithAudio().length) enabled = enabled.filter(id => id !== 'song');
+  if (!exercises.length) enabled = enabled.filter(id => id !== 'exercise');
+  if (!enabled.length) return null;
+  const count = clamp(Math.round(total / 210), 2, 18);       // roughly 3½ minutes per item
+  const target = Math.max(45, (total - count * brk) / count);
+  // order: a warm-up first, then the rest mixed so no kind comes twice in a row,
+  // finishing on a backing track or a song when those are included
+  const order = [];
+  const middle = enabled.filter(k => k !== 'exercise' || enabled.length === 1);
+  if (enabled.includes('exercise')) order.push('exercise');
+  const finisher = ['band', 'song'].filter(k => enabled.includes(k));
+  let bag = [];
+  while (order.length < count - (finisher.length ? 1 : 0)) {
+    if (!bag.length) bag = shuffleList(middle.slice());
+    let k = bag.shift();
+    if (k === order[order.length - 1] && bag.length) { bag.push(k); k = bag.shift(); }
+    order.push(k);
+  }
+  if (finisher.length) {
+    // finish on a backing track or song — preferably one that hasn't come up yet, and never twice in a row
+    const fresh = finisher.filter(x => !order.includes(x) && x !== order[order.length - 1]);
+    const ok = finisher.filter(x => x !== order[order.length - 1]);
+    order.push(rnd(fresh.length ? fresh : ok.length ? ok : finisher));
+  }
+  const used = new Set();
+  const plan = { id: 'surprise', name: `Surprise · ${mins} min`, breakSec: brk, items: [] };
+  for (const k of order.slice(0, count)) {
+    const it = surpriseItem(k, target, used);
+    if (it) plan.items.push(it);
+  }
+  // Fine-tune: stretch or shrink the items that can change length until the total lands close
+  for (let pass = 0; pass < 12; pass++) {
+    const diff = total - routineTotalSec(plan);
+    if (Math.abs(diff) <= Math.max(30, total * 0.04)) break;
+    const flex = plan.items.filter(it => it.type !== 'triad' || it.mode === 'quiz');
+    if (!flex.length) break;
+    const share = diff / flex.length;
+    flex.forEach(it => adjustSurpriseItem(it, share));
+  }
+  return plan;
+}
+
+function renderSurprise(keepPlan) {
+  draft = null;
+  const v = $('view'), c = surpriseChoices();
+  const hasSongs = songsWithAudio().length > 0;
+  if (!keepPlan) surprisePlan = null;
+  let html = `<div class="row"><button class="btn small" id="spBack">‹ Back</button></div>
+    <h1>🎲 Surprise me</h1>
+    <h2>How long?</h2>
+    <div class="chips">${[10, 15, 20, 30, 45, 60].map(m => `<button class="chip${c.mins === m ? ' on' : ''}" data-mins="${m}">${m}</button>`).join('')}</div>
+    <p class="muted" style="text-align:center;margin:6px 0 0">minutes</p>
+    <h2>Include</h2>
+    <div class="card">${SURPRISE_KINDS.map(k => {
+      const off = k.id === 'song' && !hasSongs;
+      return `<label class="toggle"><span>${k.label}${off ? ' <small class="muted">(import a song first)</small>' : ''}</span>
+        <input type="checkbox" data-kind="${k.id}" ${c.kinds[k.id] && !off ? 'checked' : ''} ${off ? 'disabled' : ''}></label>`;
+    }).join('')}</div>
+    <button class="btn wide primary start" id="spBuild">🎲 ${surprisePlan ? 'Shuffle again' : 'Build my session'}</button>`;
+  if (surprisePlan) {
+    const segs = buildSegments(surprisePlan);
+    html += `<h2>Your session · about ${fmtShort(routineTotalSec(surprisePlan))}</h2><div class="card">` +
+      surprisePlan.items.map((it, k) => {
+        const dur = segs.filter(x => x.item === k).reduce((t, x) => t + x.duration, 0);
+        return `<div class="sp-row"><span>${k + 1}. ${esc(itemName(it))}</span><span class="muted">${fmtShort(dur)}</span></div>`;
+      }).join('') + `</div>
+      <button class="btn wide primary start" id="spStart">▶ Start</button>
+      <button class="btn wide" id="spSave">💾 Save as routine</button>`;
+  }
+  v.innerHTML = html;
+  window.scrollTo(0, keepPlan ? document.body.scrollHeight : 0);
+
+  const save = () => { settings.surprise = c; saveSettings(); };
+  $('spBack').addEventListener('click', () => showTab('routines'));
+  v.querySelectorAll('[data-mins]').forEach(b => b.addEventListener('click', () => {
+    c.mins = +b.dataset.mins; save(); surprisePlan = null; renderSurprise(false);
+  }));
+  v.querySelectorAll('input[data-kind]').forEach(el => el.addEventListener('change', () => {
+    c.kinds[el.dataset.kind] = el.checked; save();
+  }));
+  $('spBuild').addEventListener('click', () => {
+    save();
+    const plan = buildSurprise(c.mins, c.kinds);
+    if (!plan || !plan.items.length) { toast('Pick at least one kind of practice'); return; }
+    surprisePlan = plan;
+    renderSurprise(true);
+  });
+  if (surprisePlan) {
+    $('spStart').addEventListener('click', () => startSession(surprisePlan));
+    $('spSave').addEventListener('click', () => {
+      const d = new Date();
+      const name = prompt('Name this routine:', `Surprise ${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`);
+      if (name === null) return;
+      const copy = JSON.parse(JSON.stringify(surprisePlan));
+      copy.id = uid(); copy.name = name.trim() || 'Surprise';
+      routines.push(copy); saveRoutines();
+      toast('Saved to your routines');
+    });
+  }
+}
+
 /* ---------- Exercise library ---------- */
 function renderExercises() {
   const v = $('view');
@@ -2834,7 +3025,7 @@ function renderSettings() {
       <button class="btn wide" id="importBtn">Import backup</button>
       <input type="file" id="importFile" accept=".json,application/json" hidden>
     </div>
-    <p class="muted" style="text-align:center;margin-top:24px">Roadie · Phase 4</p>`;
+    <p class="muted" style="text-align:center;margin-top:24px">Roadie · Phase 5</p>`;
   fillVoiceSelect($('voiceSel'));
 
   v.querySelectorAll('[data-s]').forEach(el => {
