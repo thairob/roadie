@@ -21,6 +21,7 @@
     <nav id="tabs">
       <button data-tab="routines">Routines</button>
       <button data-tab="exercises">Exercises</button>
+      <button data-tab="songs">Songs</button>
       <button data-tab="settings">Settings</button>
     </nav>
   </div>
@@ -39,6 +40,9 @@
     <div id="s-hint-left">⟲ restart<br><small>hold: previous</small></div>
     <div id="s-hint-center">tap: pause</div>
     <div id="s-hint-right">skip ⏭</div>
+    <div id="s-rwhint"></div>
+    <div id="s-strip">❚❚ Pause</div>
+    <div id="rwflash"></div>
 
     <!-- The three tap zones sit on top of everything above -->
     <div id="zones"></div>
@@ -49,7 +53,11 @@
     <div id="paused" hidden>
       <div id="paused-msg"></div>
       <button id="btn-resume" class="huge">Resume</button>
-      <button id="btn-end" class="ghost">End session</button>
+      <div class="pause-row">
+        <button id="btn-restart" class="ghost">⟲ Restart</button>
+        <button id="btn-skip" class="ghost">Skip ⏭</button>
+        <button id="btn-end" class="ghost">End session</button>
+      </div>
     </div>
 
     <div id="done" hidden>

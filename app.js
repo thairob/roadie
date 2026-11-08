@@ -1,4 +1,4 @@
-/* Roadie — Phase 1: core practice runner
+/* Roadie — Phase 2: core practice runner + songs
    Plain JavaScript, no build step. */
 'use strict';
 
@@ -18,7 +18,36 @@ const LS = {
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
 const num = (v, d) => { const n = parseFloat(v); return isFinite(n) ? n : d; };
+const round1 = n => Math.round(n * 10) / 10;
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/* Song audio lives in IndexedDB (too big for localStorage) */
+const DB = {
+  db: null,
+  open() {
+    if (this.db) return Promise.resolve(this.db);
+    return new Promise((res, rej) => {
+      const r = indexedDB.open('roadie', 1);
+      r.onupgradeneeded = () => { if (!r.result.objectStoreNames.contains('audio')) r.result.createObjectStore('audio'); };
+      r.onsuccess = () => { this.db = r.result; res(this.db); };
+      r.onerror = () => rej(r.error);
+    });
+  },
+  async run(mode, fn) {
+    const db = await this.open();
+    return new Promise((res, rej) => {
+      const tx = db.transaction('audio', mode);
+      const req = fn(tx.objectStore('audio'));
+      tx.oncomplete = () => res(req ? req.result : undefined);
+      tx.onerror = () => rej(tx.error);
+      tx.onabort = () => rej(tx.error);
+    });
+  },
+  put(key, val) { return this.run('readwrite', s => s.put(val, key)); },
+  get(key) { return this.run('readonly', s => s.get(key)); },
+  del(key) { return this.run('readwrite', s => s.delete(key)); },
+  keys() { return this.run('readonly', s => s.getAllKeys()); }
+};
 
 /* =========================================================
    Built-in drills and defaults
@@ -79,13 +108,20 @@ function starterRoutines() {
 let settings = Object.assign({}, DEFAULT_SETTINGS, LS.get('settings', {}));
 let exercises = LS.get('exercises', null);
 let routines = LS.get('routines', null);
+let songs = LS.get('songs', []);
 if (!exercises) { exercises = BUILTIN_EXERCISES.map(e => Object.assign({}, e)); LS.set('exercises', exercises); }
 if (!routines) { routines = starterRoutines(); LS.set('routines', routines); }
 
 const saveSettings = () => LS.set('settings', settings);
 const saveExercises = () => LS.set('exercises', exercises);
 const saveRoutines = () => LS.set('routines', routines);
+const saveSongs = () => LS.set('songs', songs);
 const findEx = id => exercises.find(e => e.id === id);
+const findSong = id => songs.find(s => s.id === id);
+const findSection = (song, id) => song ? song.sections.find(s => s.id === id) : null;
+const isSongItem = it => it && it.type === 'song';
+
+let audioIds = new Set();   // songs whose audio file is stored on the phone
 
 /* =========================================================
    Time formatting
@@ -94,6 +130,16 @@ function fmtClock(sec) {
   sec = Math.max(0, Math.ceil(sec));
   const m = Math.floor(sec / 60), s = sec % 60;
   return m + ':' + String(s).padStart(2, '0');
+}
+function fmtPos(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m + ':' + String(s).padStart(2, '0');
+}
+function fmtTenths(sec) {
+  sec = Math.max(0, sec || 0);
+  const m = Math.floor(sec / 60), s = sec - m * 60;
+  return m + ':' + (s < 10 ? '0' : '') + s.toFixed(1);
 }
 function fmtShort(sec) {
   sec = Math.round(sec);
@@ -127,11 +173,10 @@ function ensureAudio(rebuild) {
   if (!ctx) {
     const AC = window.AudioContext || window.webkitAudioContext;
     ctx = new AC();
-    // If iPhone interrupts the sound (for example while the voice talks), try to bring it straight back
+    // If iPhone interrupts the click sound, try to bring it straight back —
+    // but never while the voice is talking, or iPhone silences the voice
     ctx.onstatechange = () => {
-      // Never grab the speaker back while the voice is talking, or iPhone silences the voice
-      if (ctx && ctx.state !== 'running' && ctx.state !== 'closed' && S.active &&
-          (S.phase === 'countin' || S.phase === 'play') && !speechBusy()) {
+      if (ctx && ctx.state !== 'running' && ctx.state !== 'closed' && S.active && clicksNeededNow() && !speechBusy()) {
         try { ctx.resume(); } catch (e) {}
       }
     };
@@ -191,13 +236,14 @@ function playClick(time, accent) {
 }
 
 const Metro = {
-  running: false, bpm: 80, nextTime: 0, beat: 0, countIn: 4, timer: null,
+  running: false, bpm: 80, nextTime: 0, beat: 0, countIn: 4, countOnly: false, timer: null,
   queue: [],              // scheduled beats for the visual flash: {time, beat, accent}
   onBeat: null,           // called when a beat is actually heard
-  start(bpm, startTime, countIn) {
+  start(bpm, startTime, countIn, countOnly) {
     this.stop();
     this.bpm = bpm; this.nextTime = startTime; this.countIn = countIn;
-    this.beat = -countIn;  // negative beats = count-in
+    this.countOnly = !!countOnly;   // songs: click the count-in only, then go quiet
+    this.beat = -countIn;           // negative beats = count-in
     this.running = true;
     this.schedule();
     this.timer = setInterval(() => this.schedule(), 25);
@@ -208,9 +254,13 @@ const Metro = {
     this.timer = null; this.queue = [];
   },
   schedule() {
-    if (!this.running) return;
+    if (!this.running || !ctx) return;
     const ahead = 0.12, interval = 60 / this.bpm, bpb = settings.beatsPerBar;
     while (this.nextTime < ctx.currentTime + ahead) {
+      if (this.countOnly && this.beat >= 0) {
+        this.running = false; clearInterval(this.timer); this.timer = null;
+        return;
+      }
       const accent = this.beat < 0 ? this.beat === -this.countIn : (this.beat % bpb === 0);
       playClick(this.nextTime, accent);
       this.queue.push({ time: this.nextTime, beat: this.beat, accent });
@@ -227,6 +277,85 @@ const Metro = {
     }
   }
 };
+
+/* =========================================================
+   Song player (one audio element, reused everywhere)
+   ========================================================= */
+const songEl = new Audio();
+songEl.preload = 'auto';
+songEl.setAttribute('playsinline', '');
+songEl.setAttribute('webkit-playsinline', '');
+const songUrls = {};       // song id -> object URL
+
+function setPreservePitch() {
+  try { songEl.preservesPitch = true; } catch (e) {}
+  try { songEl.webkitPreservesPitch = true; } catch (e) {}
+  try { songEl.mozPreservesPitch = true; } catch (e) {}
+}
+setPreservePitch();
+
+// A tiny silent sound used to "unlock" the song player from a tap
+const SILENT_URL = (() => {
+  const rate = 8000, n = 800, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, 'data'); v.setUint32(40, n * 2, true);
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+})();
+
+let unlockPromise = Promise.resolve();
+function unlockSongPlayer() {
+  // Called inside a tap: iPhone only lets an audio player start if it was first started by a tap
+  songEl.muted = true;
+  songEl.src = SILENT_URL;
+  songEl.dataset.song = '';
+  let p;
+  try { p = songEl.play(); } catch (e) { p = null; }
+  unlockPromise = Promise.resolve(p)
+    .then(() => { if (songEl.src === SILENT_URL) songEl.pause(); })
+    .catch(() => {})
+    .then(() => { songEl.muted = false; });
+}
+
+async function getSongUrl(id) {
+  if (songUrls[id]) return songUrls[id];
+  const rec = await DB.get(id);
+  if (!rec) return null;
+  const blob = rec instanceof Blob ? rec : new Blob([rec.data], { type: rec.type || 'audio/mpeg' });
+  songUrls[id] = URL.createObjectURL(blob);
+  return songUrls[id];
+}
+function forgetSongUrl(id) {
+  if (songUrls[id]) { URL.revokeObjectURL(songUrls[id]); delete songUrls[id]; }
+  if (songEl.dataset.song === id) { songEl.pause(); songEl.removeAttribute('src'); songEl.dataset.song = ''; }
+}
+
+function waitForMetadata(el, ms) {
+  return new Promise(res => {
+    if (el.readyState >= 1) return res();
+    let done = false;
+    const fin = () => { if (done) return; done = true; el.removeEventListener('loadedmetadata', fin); res(); };
+    el.addEventListener('loadedmetadata', fin);
+    setTimeout(fin, ms || 5000);
+  });
+}
+
+// Load a song into the player (if it isn't already) and park it at a position
+async function loadSongInto(songId) {
+  await unlockPromise;
+  if (songEl.dataset.song !== songId) {
+    const url = await getSongUrl(songId);
+    if (!url) return false;
+    songEl.src = url;
+    songEl.dataset.song = songId;
+    try { songEl.load(); } catch (e) {}
+  }
+  await waitForMetadata(songEl, 5000);
+  return true;
+}
+function seekSong(t) { try { songEl.currentTime = Math.max(0, t); } catch (e) {} }
 
 /* =========================================================
    Voice
@@ -301,9 +430,10 @@ function releaseWakeLock() {
 /* =========================================================
    Building a session plan from a routine
    ========================================================= */
-function ladderSteps(l) {
+function ladderSteps(l, lo, hi) {
+  lo = lo || 20; hi = hi || 400;
   const out = [];
-  const start = Math.round(num(l.start, 60)), end = Math.round(num(l.end, start));
+  const start = clamp(Math.round(num(l.start, 60)), lo, hi), end = clamp(Math.round(num(l.end, start)), lo, hi);
   let step = Math.abs(Math.round(num(l.step, 5))) || 5;
   if (end < start) step = -step;
   for (let b = start; (step > 0 ? b <= end : b >= end) && out.length < 60; b += step) out.push(b);
@@ -311,14 +441,48 @@ function ladderSteps(l) {
   return out;
 }
 function barsToSec(bars, bpm) { return bars * settings.beatsPerBar * 60 / bpm; }
+const loopsText = n => n + (n === 1 ? ' loop' : ' loops');
+
+function songSegment(item, idx, song, sec, pct, mode, amount) {
+  const rate = clamp(pct, 25, 150) / 100;
+  const len = Math.max(0.5, sec.end - sec.start);
+  amount = Math.max(1, Math.round(num(amount, mode === 'loops' ? 4 : 60)));
+  return {
+    kind: 'song', item: idx, name: song.name, section: sec.name, songId: song.id,
+    start: sec.start, end: sec.end, len, pct: Math.round(rate * 100), rate, mode, amount,
+    duration: mode === 'loops' ? amount * len / rate : amount,
+    durText: mode === 'loops' ? loopsText(amount) : fmtSpoken(amount),
+    rewind: num(item.rewind, 15),
+    bpm: song.bpm ? Math.round(song.bpm * rate) : null,
+    tip: ''
+  };
+}
 
 function buildSegments(routine) {
   const segs = [];
+  const brk = num(routine.breakSec, 15);
   routine.items.forEach((item, idx) => {
+    if (isSongItem(item)) {
+      const song = findSong(item.songId), sec = findSection(song, item.sectionId);
+      if (!song || !sec) return;
+      if (item.ladder) {
+        const l = item.ladder, steps = ladderSteps(l, 25, 150);
+        steps.forEach((pct, k) => {
+          const seg = songSegment(item, idx, song, sec, pct, l.mode === 'time' ? 'time' : 'loops', l.amount);
+          seg.ladder = { k: k + 1, n: steps.length, start: steps[0], end: steps[steps.length - 1] };
+          seg.breakBefore = k === 0 ? brk : num(l.breakSec, 3);
+          segs.push(seg);
+        });
+      } else {
+        const seg = songSegment(item, idx, song, sec, num(item.speed, 100), item.mode === 'time' ? 'time' : 'loops', item.amount);
+        seg.ladder = null; seg.breakBefore = brk;
+        segs.push(seg);
+      }
+      return;
+    }
     const ex = findEx(item.exId);
     const name = ex ? ex.name : (item.name || 'Exercise');
     const tip = ex ? (ex.tip || '') : '';
-    const brk = num(routine.breakSec, 15);
     if (item.ladder) {
       const l = item.ladder;
       const steps = ladderSteps(l);
@@ -327,7 +491,7 @@ function buildSegments(routine) {
         const dur = l.mode === 'bars' ? barsToSec(amt, bpm) : amt;
         const durText = l.mode === 'bars' ? amt + (amt === 1 ? ' bar' : ' bars') : fmtSpoken(amt);
         segs.push({
-          item: idx, name, tip, bpm, duration: dur, durText,
+          kind: 'exercise', item: idx, name, tip, bpm, duration: dur, durText,
           ladder: { k: k + 1, n: steps.length, start: steps[0], end: steps[steps.length - 1] },
           breakBefore: k === 0 ? brk : num(l.breakSec, 3)
         });
@@ -335,7 +499,7 @@ function buildSegments(routine) {
     } else {
       const bpm = clamp(Math.round(num(item.bpm, 80)), 20, 400);
       const dur = Math.max(5, num(item.duration, 60));
-      segs.push({ item: idx, name, tip, bpm, duration: dur, durText: fmtSpoken(dur), ladder: null, breakBefore: brk });
+      segs.push({ kind: 'exercise', item: idx, name, tip, bpm, duration: dur, durText: fmtSpoken(dur), ladder: null, breakBefore: brk });
     }
   });
   if (segs.length) segs[0].breakBefore = num(settings.firstBreak, 5);
@@ -344,21 +508,25 @@ function buildSegments(routine) {
 
 function routineTotalSec(routine) {
   const segs = buildSegments(routine);
-  return segs.reduce((t, s) => t + s.duration + s.breakBefore + 4 * 60 / s.bpm, 0);
+  return segs.reduce((t, s) => t + s.duration + s.breakBefore + (s.bpm ? 4 * 60 / s.bpm : 2), 0);
 }
 
 function announcement(seg) {
   const parts = [];
+  const speed = seg.kind === 'song' ? `${seg.pct} percent` : `${seg.bpm} BPM`;
+  const label = seg.kind === 'song' ? seg.section : seg.name;
   if (seg.ladder && seg.ladder.k > 1) {
-    if (settings.cueLadder) parts.push(`${seg.name}, step ${seg.ladder.k} of ${seg.ladder.n}, ${seg.bpm} BPM, ${seg.durText}.`);
+    if (settings.cueLadder) parts.push(`${label}, step ${seg.ladder.k} of ${seg.ladder.n}, ${speed}, ${seg.durText}.`);
     return parts.join(' ');
   }
   if (settings.cueNext) {
+    const title = seg.kind === 'song' ? `${seg.name}, ${seg.section}` : seg.name;
     if (seg.ladder) {
-      parts.push(`Next up: ${seg.name}. Speed ladder, ${seg.ladder.n} steps, ${seg.ladder.start} to ${seg.ladder.end} BPM.`);
-      if (settings.cueLadder) parts.push(`Step 1, ${seg.bpm} BPM, ${seg.durText}.`);
+      const unit = seg.kind === 'song' ? 'percent' : 'BPM';
+      parts.push(`Next up: ${title}. Speed ladder, ${seg.ladder.n} steps, ${seg.ladder.start} to ${seg.ladder.end} ${unit}.`);
+      if (settings.cueLadder) parts.push(`Step 1, ${speed}, ${seg.durText}.`);
     } else {
-      parts.push(`Next up: ${seg.name}, ${seg.bpm} BPM, ${seg.durText}.`);
+      parts.push(`Next up: ${title}, ${speed}, ${seg.durText}.`);
     }
   }
   if (settings.cueTip && seg.tip) parts.push(seg.tip);
@@ -372,26 +540,56 @@ const S = {
   active: false, routine: null, segs: [], i: 0,
   phase: 'idle',            // break | countin | play | paused | done
   breakEnd: 0, speechDone: true,
-  countStart: 0, playStart: 0, segRemaining: 0,
+  countStart: 0, countBpm: 80, playStart: 0, segRemaining: 0,
   cue30Done: false, pausedFrom: null,
   undoSnap: null, undoTimer: null,
-  raf: 0, ticker: 0
+  raf: 0, ticker: 0,
+  // song state
+  loop: 0, songStartPos: 0, songReady: false, songEnded: false, lastLoopAt: 0,
+  spoken: false, countDone: false, countSpeakAt: 0, prepToken: 0
 };
 const $ = id => document.getElementById(id);
 // Session timing uses the phone's normal clock. The audio clock can freeze on iPhone
 // (for example while the voice is talking), so it is only used to schedule clicks.
 const now = () => performance.now() / 1000;
+const curSeg = () => S.segs[S.i];
+const isSongSeg = seg => !!seg && seg.kind === 'song';
 
-function startSession(routineId) {
+// Does this segment's count-in (and playing) use the click sound?
+function needsClicks(seg) {
+  if (!seg) return false;
+  if (seg.kind === 'exercise') return true;
+  return !!seg.bpm || !settings.voiceOn;
+}
+function clicksNeededNow() {
+  const seg = curSeg();
+  if (!seg) return false;
+  if (seg.kind === 'exercise') return S.phase === 'countin' || S.phase === 'play';
+  return S.phase === 'countin' && !S.spoken;
+}
+
+async function startSession(routineId) {
   const routine = routines.find(r => r.id === routineId);
-  if (!routine || !routine.items.length) { toast('Add some exercises to this routine first'); return; }
+  if (!routine || !routine.items.length) { toast('Add something to this routine first'); return; }
+  // Check every song still has its audio on this phone
+  for (const it of routine.items) {
+    if (!isSongItem(it)) continue;
+    const song = findSong(it.songId);
+    if (!song || !findSection(song, it.sectionId)) { toast('A song in this routine was deleted — edit the routine'); return; }
+    if (!audioIds.has(song.id)) { toast(`"${song.name}" needs its audio file — open it in Songs and tap Replace audio`); return; }
+  }
+  const segs = buildSegments(routine);
+  if (!segs.length) { toast('Nothing to play in this routine'); return; }
+  stopEditor();
+  // Everything that needs a tap to unlock happens right here
   ensureAudio();
   unlockSpeech();
+  if (segs.some(isSongSeg)) unlockSongPlayer();
   requestWakeLock();
-  S.active = true; S.routine = routine; S.segs = buildSegments(routine);
+  S.active = true; S.routine = routine; S.segs = segs;
   $('app').hidden = true;
   $('session').hidden = false;
-  $('done').hidden = true; $('paused').hidden = true; $('undo').hidden = true;
+  $('done').hidden = true; $('paused').hidden = true; $('undo').hidden = true; $('nosound').hidden = true;
   buildBeatDots();
   Metro.onBeat = onBeat;
   enterBreak(0);
@@ -404,11 +602,14 @@ function startSession(routineId) {
 
 function enterBreak(i) {
   Metro.stop(); stopSpeech();
+  songEl.pause();
   S.i = i; S.phase = 'break';
   const seg = S.segs[i];
   S.breakEnd = now() + Math.max(1, seg.breakBefore);
   S.speechDone = false;
   S.speechStartedAt = now();
+  S.audioWaitUntil = 0;
+  if (isSongSeg(seg)) prepareSong(seg, seg.start);
   const text = announcement(seg);
   // Take turns: pause Roadie's own sound so iPhone lets the voice through,
   // then the sound is switched back on before the count-in.
@@ -426,21 +627,93 @@ function enterBreak(i) {
   render();
 }
 
-function enterCountIn(remaining) {
+function prepareSong(seg, pos) {
+  const token = ++S.prepToken;
+  S.songReady = false;
+  loadSongInto(seg.songId).then(ok => {
+    if (token !== S.prepToken) return;
+    if (!ok) { toast('Could not load the song audio'); return; }
+    if (S.phase !== 'play') seekSong(pos);
+    S.songReady = true;
+  });
+}
+
+function enterCountIn(remaining, songState) {
   Metro.stop(); stopSpeech();
-  const seg = S.segs[S.i];
+  const seg = curSeg();
   S.phase = 'countin';
   S.segRemaining = remaining;
   S.cue30Done = remaining <= 31;
+  S.spoken = false;
+  if (isSongSeg(seg)) {
+    songEl.pause();
+    S.loop = songState ? songState.loop : 0;
+    S.songStartPos = songState ? songState.pos : seg.start;
+    prepareSong(seg, S.songStartPos);
+    if (!needsClicks(seg)) {
+      // No song BPM: a spoken "3, 2, 1" instead of clicks
+      S.spoken = true; S.countDone = false; S.countSpeakAt = now();
+      const talk = () => {
+        if (S.phase !== 'countin' || curSeg() !== seg) return;
+        S.countSpeakAt = now();
+        speak('Three. Two. One.', () => { S.countDone = true; });
+      };
+      if (ctx && ctx.state === 'running') ctx.suspend().then(talk, talk); else talk();
+      render();
+      return;
+    }
+  }
+  const bpm = isSongSeg(seg) ? (seg.bpm || 90) : seg.bpm;
   if (ctx.state !== 'running') { try { ctx.resume(); } catch (e) {} }
+  S.countBpm = bpm;
   S.countStart = now() + 0.15;
-  S.playStart = S.countStart + 4 * 60 / seg.bpm;
-  Metro.start(seg.bpm, ctx.currentTime + 0.15, 4);
+  S.playStart = S.countStart + 4 * 60 / bpm;
+  Metro.start(bpm, ctx.currentTime + 0.15, 4, isSongSeg(seg));
   render();
 }
 
+function startSongPlay() {
+  const seg = curSeg();
+  S.phase = 'play';
+  S.playStart = now();
+  S.songEnded = false; S.lastLoopAt = now();
+  songEl.defaultPlaybackRate = seg.rate;
+  songEl.playbackRate = seg.rate;
+  setPreservePitch();
+  if (Math.abs(songEl.currentTime - S.songStartPos) > 0.05) seekSong(S.songStartPos);
+  const want = S.songStartPos;
+  const fix = () => {
+    songEl.removeEventListener('playing', fix);
+    // Some iPhones ignore a jump made before playback; make it again once playing
+    if (Math.abs(songEl.currentTime - want) > 0.4 && S.phase === 'play') seekSong(want);
+    songEl.playbackRate = seg.rate;
+  };
+  songEl.addEventListener('playing', fix);
+  try { const p = songEl.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+  render();
+}
+
+songEl.addEventListener('ended', () => { if (S.active && S.phase === 'play') S.songEnded = true; });
+
+function songLoopDone() {
+  const seg = curSeg();
+  S.songEnded = false;
+  S.lastLoopAt = now();
+  S.loop++;
+  if (seg.mode === 'loops' && S.loop >= seg.amount) { endSegment(); return; }
+  seekSong(seg.start);
+  if (songEl.paused) { try { const p = songEl.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {} }
+}
+
+function endSegment() {
+  Metro.stop();
+  songEl.pause();
+  if (S.i + 1 < S.segs.length) enterBreak(S.i + 1);
+  else finish();
+}
+
 function currentRemaining() {
-  const seg = S.segs[S.i];
+  const seg = curSeg();
   if (!seg) return 0;
   if (S.phase === 'play') return S.segRemaining - (now() - S.playStart);
   if (S.phase === 'countin') return S.segRemaining;
@@ -452,16 +725,22 @@ function tick() {
   if (!S.active) return;
   Metro.poll();
   const t = now();
-  const soundOff = !!ctx && ctx.state !== 'running' && (S.phase === 'countin' || S.phase === 'play') && !speechBusy();
+  const seg = curSeg();
+
+  // Keep the click sound alive when it's needed (never while the voice talks)
+  const soundOff = !!ctx && ctx.state !== 'running' && clicksNeededNow() && !speechBusy();
   if (soundOff && t - (S.lastResume || 0) > 1) {
     S.lastResume = t;
     try { ctx.resume(); } catch (e) {}
   }
-  // Only show the "no sound" banner if the sound has been off for more than a second
-  if (soundOff) { if (!S.soundOffSince) S.soundOffSince = t; } else S.soundOffSince = 0;
-  const showBanner = soundOff && t - S.soundOffSince > 1;
+  // A song that should be playing but isn't (iPhone blocked it)
+  const songStalled = isSongSeg(seg) && S.phase === 'play' && songEl.paused && !S.songEnded && t - S.playStart > 1;
+  const problem = soundOff || songStalled;
+  if (problem) { if (!S.soundOffSince) S.soundOffSince = t; } else S.soundOffSince = 0;
+  const showBanner = problem && t - S.soundOffSince > 1;
   const nb = $('nosound');
   if (nb.hidden === showBanner) nb.hidden = !showBanner;
+
   if (S.phase === 'break') {
     // Wait for both the break timer and the voice cue, so we never talk over the count-in
     // Backups in case iPhone never reports that the voice finished
@@ -469,23 +748,40 @@ function tick() {
                          && t > S.speechStartedAt + 1.5;
     const speechTimeout = t > S.breakEnd + 8;
     if (t >= S.breakEnd && (S.speechDone || speechSilent || speechTimeout)) {
-      // Give the sound a moment to come back after the voice before counting in
-      if (ctx && ctx.state !== 'running') {
+      // Give the click sound a moment to come back after the voice before counting in
+      if (needsClicks(seg) && ctx && ctx.state !== 'running') {
         if (!S.audioWaitUntil) S.audioWaitUntil = t + 2.5;
         try { ctx.resume(); } catch (e) {}
         if (t < S.audioWaitUntil) { renderLive(); return; }
       }
       S.audioWaitUntil = 0;
-      enterCountIn(S.segs[S.i].duration);
+      enterCountIn(seg.duration);
       return;
     }
   } else if (S.phase === 'countin') {
-    if (t >= S.playStart) { S.phase = 'play'; }
+    if (isSongSeg(seg)) {
+      let countFinished;
+      if (S.spoken) {
+        const silent = !speechBusy() && t > S.countSpeakAt + 1.2;
+        countFinished = S.countDone || silent || t > S.countSpeakAt + 6;
+      } else {
+        countFinished = t >= S.playStart;
+      }
+      if (countFinished && S.songReady) { startSongPlay(); return; }
+      if (countFinished && !S.songReady && t > S.countSpeakAt + 10 && t > S.playStart + 8) {
+        toast('Song is taking a while to load…');
+      }
+    } else if (t >= S.playStart) {
+      S.phase = 'play';
+    }
   } else if (S.phase === 'play') {
-    if (currentRemaining() <= 0) {
-      Metro.stop();
-      if (S.i + 1 < S.segs.length) enterBreak(S.i + 1);
-      else finish();
+    if (isSongSeg(seg)) {
+      const pos = songEl.currentTime;
+      const atEnd = S.songEnded || (pos >= seg.end - 0.04 && t - S.lastLoopAt > 0.3);
+      if (atEnd) { songLoopDone(); if (!S.active || S.phase !== 'play') return; }
+      if (seg.mode === 'time' && currentRemaining() <= 0) { endSegment(); return; }
+    } else if (currentRemaining() <= 0) {
+      endSegment();
       return;
     }
   }
@@ -503,8 +799,9 @@ function onBeat(b) {
   const bpb = settings.beatsPerBar;
   const pos = b.beat < 0 ? (b.beat + 4) : (b.beat % bpb);
   for (let k = 0; k < dots.length; k++) dots[k].className = k === pos ? ('on' + (b.accent ? ' accent' : '')) : '';
-  // "30 seconds left" — spoken right after a beat, never during count-in
-  if (S.phase === 'play' && settings.cue30 && !S.cue30Done && S.segs[S.i].duration >= 45 && currentRemaining() <= 30) {
+  // "30 seconds left" — spoken right after a beat, never during count-in, never over a song
+  const seg = curSeg();
+  if (seg && seg.kind === 'exercise' && S.phase === 'play' && settings.cue30 && !S.cue30Done && seg.duration >= 45 && currentRemaining() <= 30) {
     S.cue30Done = true;
     speak('30 seconds left');
   }
@@ -517,9 +814,10 @@ function buildBeatDots() {
 
 function finish() {
   Metro.stop();
+  songEl.pause();
   S.phase = 'done';
   const total = S.segs.reduce((t, s) => t + s.duration, 0);
-  $('done-sub').textContent = `${S.routine.name} · ${fmtShort(total)} of playing`;
+  $('done-sub').textContent = `${S.routine.name} · about ${fmtShort(total)} of playing`;
   $('done').hidden = false;
   $('paused').hidden = true;
   if (settings.cueDone) speak('Session complete.'); else stopSpeech();
@@ -529,8 +827,13 @@ function finish() {
 
 function pause() {
   if (!['break', 'countin', 'play'].includes(S.phase)) return;
+  const seg = curSeg();
   S.pausedFrom = { phase: S.phase, rem: currentRemaining() };
-  Metro.stop(); stopSpeech();
+  if (isSongSeg(seg)) {
+    S.pausedFrom.loop = S.loop;
+    S.pausedFrom.pos = S.phase === 'play' ? songEl.currentTime : S.songStartPos;
+  }
+  Metro.stop(); stopSpeech(); songEl.pause();
   S.phase = 'paused';
   render();
 }
@@ -541,18 +844,24 @@ function resume() {
   requestWakeLock();
   const p = S.pausedFrom; S.pausedFrom = null;
   if (p.phase === 'break') enterBreak(S.i);
-  else enterCountIn(p.rem);
+  else enterCountIn(p.rem, isSongSeg(curSeg()) ? { loop: p.loop, pos: p.pos } : null);
 }
 
 function snapshot() {
-  return { i: S.i, phase: S.phase === 'paused' ? S.pausedFrom.phase : S.phase, rem: currentRemaining() };
+  const seg = curSeg();
+  const snap = { i: S.i, phase: S.phase === 'paused' ? S.pausedFrom.phase : S.phase, rem: currentRemaining() };
+  if (isSongSeg(seg)) {
+    if (S.phase === 'paused') { snap.loop = S.pausedFrom.loop; snap.pos = S.pausedFrom.pos; }
+    else { snap.loop = S.loop; snap.pos = S.phase === 'play' ? songEl.currentTime : S.songStartPos; }
+  }
+  return snap;
 }
 
 function restartCurrent() {
   if (!S.active || S.phase === 'done') return;
   ensureAudio();
   const snap = snapshot();
-  enterCountIn(S.segs[S.i].duration);
+  enterCountIn(curSeg().duration);
   showUndo('Restarted — tap to undo', snap);
 }
 
@@ -570,17 +879,34 @@ function previousExercise() {
   ensureAudio();
   $('done').hidden = true;
   // Jump to the start of the previous exercise (whole ladder counts as one exercise)
-  const curItem = S.segs[S.i].item;
-  let target = S.i;
+  const curItem = curSeg().item;
+  let target;
   const firstOfCur = S.segs.findIndex(s => s.item === curItem);
   if (S.phase === 'break' || S.i === firstOfCur) {
-    const prevItem = curItem - 1;
-    target = prevItem >= 0 ? S.segs.findIndex(s => s.item === prevItem) : 0;
+    let k = firstOfCur - 1;
+    target = k >= 0 ? S.segs.findIndex(s => s.item === S.segs[k].item) : 0;
   } else {
     target = firstOfCur;
   }
   enterBreak(Math.max(0, target));
-  toast('Previous exercise');
+  toast('Previous');
+}
+
+function rewindSong() {
+  const seg = curSeg();
+  if (!isSongSeg(seg)) return;
+  const amt = seg.rewind;
+  if (S.phase === 'play') {
+    seekSong(Math.max(seg.start, songEl.currentTime - amt));   // never wraps, so the loop count is unchanged
+  } else if (S.phase === 'paused' && S.pausedFrom && S.pausedFrom.phase !== 'break') {
+    S.pausedFrom.pos = Math.max(seg.start, S.pausedFrom.pos - amt);
+    render();
+  } else {
+    return;
+  }
+  const f = $('rwflash');
+  f.textContent = `⟲ ${amt}`;
+  f.classList.remove('show'); void f.offsetWidth; f.classList.add('show');
 }
 
 function showUndo(text, snap) {
@@ -599,12 +925,13 @@ function doUndo() {
   if (S.phase === 'done') { $('done').hidden = true; requestWakeLock(); }
   S.i = snap.i;
   if (snap.phase === 'break') enterBreak(snap.i);
-  else enterCountIn(Math.max(1, snap.rem));
+  else enterCountIn(Math.max(1, snap.rem), isSongSeg(curSeg()) ? { loop: snap.loop || 0, pos: snap.pos } : null);
 }
 
 function endSession() {
   S.active = false;
   Metro.stop(); stopSpeech(); releaseWakeLock();
+  songEl.pause();
   cancelAnimationFrame(S.raf); clearInterval(S.ticker);
   clearTimeout(S.undoTimer);
   S.phase = 'idle';
@@ -615,20 +942,36 @@ function endSession() {
 
 /* ---------- Session rendering ---------- */
 function render() {
-  const seg = S.segs[S.i];
+  const seg = curSeg();
   if (!seg) return;
+  const song = isSongSeg(seg);
+  $('session').classList.toggle('song', song);
   const itemCount = S.routine.items.length;
-  $('s-progress').textContent = `Exercise ${seg.item + 1} of ${itemCount}`;
+  $('s-progress').textContent = `${song ? 'Song' : 'Exercise'} · ${seg.item + 1} of ${itemCount}`;
   $('s-name').textContent = seg.name;
-  $('s-sub').textContent = `${seg.bpm} BPM` + (seg.ladder ? ` · step ${seg.ladder.k}/${seg.ladder.n}` : '');
+  const step = seg.ladder ? ` · step ${seg.ladder.k}/${seg.ladder.n}` : '';
+  $('s-sub').textContent = song ? `${seg.section} · ${seg.pct}%${step}` : `${seg.bpm} BPM${step}`;
+  $('s-rwhint').textContent = `tap anywhere up here to rewind ${seg.rewind || 15}s`;
   const next = S.segs[S.i + 1];
-  $('s-next').textContent = next ? `Next: ${next.name} · ${next.bpm} BPM` : 'Last one!';
+  $('s-next').textContent = next
+    ? `Next: ${next.kind === 'song' ? next.name + ' – ' + next.section + ' · ' + next.pct + '%' : next.name + ' · ' + next.bpm + ' BPM'}`
+    : 'Last one!';
   const paused = S.phase === 'paused';
   $('paused').hidden = !paused;
   if (paused) {
-    $('paused-msg').textContent = `Resume ${seg.name}, ${fmtClock(currentRemaining())} left?`;
+    let msg;
+    if (song && S.pausedFrom.phase !== 'break' && seg.mode === 'loops') {
+      msg = `Resume ${seg.name} – ${seg.section}, loop ${Math.min(S.pausedFrom.loop + 1, seg.amount)} of ${seg.amount}?`;
+    } else if (song) {
+      msg = `Resume ${seg.name} – ${seg.section}, ${fmtClock(currentRemaining())} left?`;
+    } else {
+      msg = `Resume ${seg.name}, ${fmtClock(currentRemaining())} left?`;
+    }
+    $('paused-msg').textContent = msg;
   }
-  if (S.phase !== 'countin' && S.phase !== 'play') {
+  // Beat dots only when clicks are playing
+  $('s-beats').style.visibility = (song && !(S.phase === 'countin' && !S.spoken)) ? 'hidden' : 'visible';
+  if (!(S.phase === 'countin' && !S.spoken) && !(S.phase === 'play' && !song)) {
     for (const d of $('s-beats').children) d.className = '';
   }
   renderLive();
@@ -636,21 +979,36 @@ function render() {
 
 function renderLive() {
   const big = $('s-big');
-  const seg = S.segs[S.i];
+  const seg = curSeg();
   if (!seg) return;
+  const song = isSongSeg(seg);
   let html = '', cls = '';
   if (S.phase === 'break') {
     const left = Math.max(0, S.breakEnd - now());
     cls = 'break';
-    html = `${left > 0 ? Math.ceil(left) : '…'}<span class="lbl">get ready · ${fmtClock(seg.duration)}</span>`;
+    const len = song ? (seg.mode === 'loops' ? seg.durText : fmtClock(seg.duration)) : fmtClock(seg.duration);
+    html = `${left > 0 ? Math.ceil(left) : '…'}<span class="lbl">get ready · ${len}</span>`;
   } else if (S.phase === 'countin') {
-    const interval = 60 / seg.bpm;
-    const n = Math.floor((now() - S.countStart) / interval);
     cls = 'countin';
-    html = n < 0 ? '4' : String(clamp(4 - n, 1, 4));
-    html += '<span class="lbl">count-in</span>';
+    if (S.spoken) {
+      html = '3·2·1<span class="lbl">count-in</span>';
+    } else {
+      const n = Math.floor((now() - S.countStart) / (60 / S.countBpm));
+      html = (n < 0 ? '4' : String(clamp(4 - n, 1, 4))) + '<span class="lbl">count-in</span>';
+    }
   } else if (S.phase === 'play' || S.phase === 'paused') {
-    html = fmtClock(currentRemaining());
+    if (song) {
+      const pos = S.phase === 'play' ? songEl.currentTime : (S.pausedFrom && S.pausedFrom.pos != null ? S.pausedFrom.pos : seg.start);
+      const loop = S.phase === 'play' ? S.loop : (S.pausedFrom && S.pausedFrom.loop) || 0;
+      const where = `${fmtPos(pos - seg.start)} / ${fmtPos(seg.len)}`;
+      if (seg.mode === 'loops') {
+        html = `${Math.min(loop + 1, seg.amount)}<small>/${seg.amount}</small><span class="lbl">loop · ${where}</span>`;
+      } else {
+        html = `${fmtClock(currentRemaining())}<span class="lbl">left · loop ${loop + 1} · ${where}</span>`;
+      }
+    } else {
+      html = fmtClock(currentRemaining());
+    }
   } else if (S.phase === 'done') {
     html = '0:00';
   }
@@ -662,7 +1020,8 @@ function renderLive() {
 (function setupZones() {
   const zones = $('zones');
   let pressTimer = null, longFired = false, startZone = null, active = false;
-  const zoneAt = x => {
+  const zoneAt = (x, y) => {
+    if (isSongSeg(curSeg())) return y > window.innerHeight * 0.8 ? 'pause' : 'rewind';
     const w = window.innerWidth;
     return x < w / 3 ? 'left' : x > 2 * w / 3 ? 'right' : 'center';
   };
@@ -670,8 +1029,9 @@ function renderLive() {
     e.preventDefault();
     if (S.phase === 'done') return;
     active = true; longFired = false;
-    startZone = zoneAt(e.clientX);
+    startZone = zoneAt(e.clientX, e.clientY);
     clearTimeout(pressTimer);
+    if (startZone === 'rewind') { rewindSong(); active = false; return; }   // instant
     if (startZone === 'left') {
       pressTimer = setTimeout(() => { longFired = true; previousExercise(); }, 650);
     }
@@ -695,19 +1055,26 @@ function renderLive() {
     ensureAudio(true);
     $('nosound').hidden = true;
     S.soundOffSince = 0;
-    if (S.phase === 'countin' || S.phase === 'play') enterCountIn(Math.max(1, currentRemaining()));
+    const seg = curSeg();
+    if (isSongSeg(seg) && S.phase === 'play') {
+      try { const p = songEl.play(); if (p && p.catch) p.catch(() => {}); } catch (err) {}
+    } else if (S.phase === 'countin' || S.phase === 'play') {
+      enterCountIn(Math.max(1, currentRemaining()), isSongSeg(seg) ? { loop: S.loop, pos: S.songStartPos } : null);
+    }
   });
   $('btn-resume').addEventListener('click', e => { e.stopPropagation(); resume(); });
+  $('btn-restart').addEventListener('click', e => { e.stopPropagation(); restartCurrent(); });
+  $('btn-skip').addEventListener('click', e => { e.stopPropagation(); skipCurrent(); });
   $('btn-end').addEventListener('click', e => { e.stopPropagation(); endSession(); });
   $('btn-done').addEventListener('click', endSession);
 })();
 
 /* Auto-pause when the app is backgrounded or the phone locks */
 document.addEventListener('visibilitychange', () => {
-  if (!S.active) return;
   if (document.hidden) {
-    pause();
-  } else {
+    if (S.active) pause();
+    else songEl.pause();
+  } else if (S.active) {
     if (S.phase !== 'done') requestWakeLock();
     render();
   }
@@ -720,19 +1087,23 @@ window.addEventListener('pagehide', () => { if (S.active) pause(); });
 let currentTab = 'routines';
 let draft = null;       // routine being edited
 let exDraft = null;     // exercise being edited
+let songDraft = null;   // song being edited
 
 function toast(msg) {
   const t = $('toast');
   t.textContent = msg; t.hidden = false;
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => { t.hidden = true; }, 2200);
+  toast._t = setTimeout(() => { t.hidden = true; }, 2600);
 }
 
 function showTab(tab) {
+  stopEditor();
+  draft = null; songDraft = null;
   currentTab = tab;
   document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   if (tab === 'routines') renderRoutines();
   else if (tab === 'exercises') renderExercises();
+  else if (tab === 'songs') renderSongs();
   else if (tab === 'settings') renderSettings();
   window.scrollTo(0, 0);
 }
@@ -747,7 +1118,7 @@ function renderRoutines() {
     const n = r.items.length;
     html += `<div class="card">
       <div class="title">${esc(r.name)}</div>
-      <div class="meta">${n} exercise${n === 1 ? '' : 's'} · about ${fmtShort(routineTotalSec(r))} · ${esc(r.breakSec)}s breaks</div>
+      <div class="meta">${n} item${n === 1 ? '' : 's'} · about ${fmtShort(routineTotalSec(r))} · ${esc(r.breakSec)}s breaks</div>
       <div class="row" style="margin-top:12px">
         <button class="btn primary start" data-start="${r.id}">▶ Start</button>
         <span class="spacer"></span>
@@ -756,7 +1127,7 @@ function renderRoutines() {
     </div>`;
   }
   html += `<button class="btn wide" id="newRoutine">+ New routine</button>
-    <p class="muted" style="margin-top:20px">Tip: turn your phone sideways once a session starts. Tap the middle to pause, the left side to restart, hold the left side to go back, the right side to skip.</p>`;
+    <p class="muted" style="margin-top:20px">Tip: turn your phone sideways once a session starts. Exercises: tap the middle to pause, the left side to restart, hold the left side to go back, the right side to skip. Songs: tap anywhere to rewind, the bottom strip to pause.</p>`;
   v.innerHTML = html;
   v.querySelectorAll('[data-start]').forEach(b => b.addEventListener('click', () => startSession(b.dataset.start)));
   v.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => editRoutine(b.dataset.edit)));
@@ -773,29 +1144,87 @@ function editRoutine(id) {
 function defaultLadder(bpm) {
   return { start: Math.max(40, bpm - 20), end: bpm, step: 5, mode: 'time', amount: 30, breakSec: 3 };
 }
+function defaultSongLadder() {
+  return { start: 60, end: 100, step: 10, mode: 'loops', amount: 2, breakSec: 3 };
+}
+
+function itemName(it) {
+  if (isSongItem(it)) {
+    const song = findSong(it.songId), sec = findSection(song, it.sectionId);
+    return song && sec ? `🎵 ${song.name} – ${sec.name}` : '🎵 Missing song';
+  }
+  const ex = findEx(it.exId);
+  return ex ? ex.name : (it.name || 'Missing exercise');
+}
+
+function ladderInfoText(it) {
+  if (isSongItem(it)) return `${ladderSteps(it.ladder, 25, 150).length} steps: ${ladderSteps(it.ladder, 25, 150).map(p => p + '%').join(' → ')}`;
+  const st = ladderSteps(it.ladder);
+  return `${st.length} steps: ${st.join(' → ')}`;
+}
 
 function renderRoutineEditor() {
   const v = $('view');
-  const exOptions = exercises.map(e => `<option value="${e.id}">${esc(e.name)}</option>`).join('');
+  let addOptions = `<optgroup label="Exercises">${exercises.map(e => `<option value="ex:${e.id}">${esc(e.name)}</option>`).join('')}</optgroup>`;
+  if (songs.length) {
+    addOptions += `<optgroup label="Songs">${songs.map(s => s.sections.map(sec =>
+      `<option value="song:${s.id}:${sec.id}">🎵 ${esc(s.name)} – ${esc(sec.name)}</option>`).join('')).join('')}</optgroup>`;
+  }
   let html = `<div class="row"><button class="btn small" data-act="cancel">‹ Back</button></div>
     <h1>${draft.id ? 'Edit routine' : 'New routine'}</h1>
     <label class="field"><span>Routine name</span><input type="text" data-f="name" value="${esc(draft.name)}"></label>
-    <label class="field"><span>Break between exercises (seconds)</span><input type="number" inputmode="numeric" data-f="breakSec" value="${esc(draft.breakSec)}"></label>
+    <label class="field"><span>Break between items (seconds)</span><input type="number" inputmode="numeric" data-f="breakSec" value="${esc(draft.breakSec)}"></label>
     <div class="muted">Total: about <b id="totalTime">${fmtShort(routineTotalSec(draft))}</b></div>
-    <h2>Exercises</h2>`;
-  if (!draft.items.length) html += `<div class="empty">No exercises yet — add one below.</div>`;
+    <h2>Exercises and songs</h2>`;
+  if (!draft.items.length) html += `<div class="empty">Nothing here yet — add something below.</div>`;
   draft.items.forEach((it, i) => {
-    const ex = findEx(it.exId);
-    const name = ex ? ex.name : (it.name || 'Missing exercise');
-    const mins = Math.floor(num(it.duration, 60) / 60), secs = Math.round(num(it.duration, 60) % 60);
-    html += `<div class="item">
+    const song = isSongItem(it);
+    html += `<div class="item${song ? ' songitem' : ''}">
       <div class="head">
-        <div class="name">${i + 1}. ${esc(name)}</div>
+        <div class="name">${i + 1}. ${esc(itemName(it))}</div>
         <button class="btn small" data-act="up" data-i="${i}" aria-label="Move up">▲</button>
         <button class="btn small" data-act="down" data-i="${i}" aria-label="Move down">▼</button>
         <button class="btn small danger" data-act="remove" data-i="${i}" aria-label="Remove">✕</button>
       </div>`;
-    if (!it.ladder) {
+    if (song) {
+      const rw = num(it.rewind, 15);
+      const rewindSel = `<label class="field"><span>Rewind button</span><select data-i="${i}" data-f="rewind">
+          ${[5, 10, 15].map(s => `<option value="${s}" ${rw === s ? 'selected' : ''}>${s} seconds</option>`).join('')}
+        </select></label>`;
+      if (!it.ladder) {
+        html += `<div class="inline-fields">
+          <label class="field"><span>Speed %</span><input type="number" inputmode="numeric" data-i="${i}" data-f="speed" value="${esc(it.speed)}"></label>
+          <label class="field"><span>Play for</span><input type="number" inputmode="numeric" data-i="${i}" data-f="amount" value="${esc(it.amount)}"></label>
+          <label class="field"><span>Measured in</span><select data-i="${i}" data-f="mode">
+            <option value="loops" ${it.mode !== 'time' ? 'selected' : ''}>loops</option>
+            <option value="time" ${it.mode === 'time' ? 'selected' : ''}>seconds</option>
+          </select></label>
+        </div>
+        ${rewindSel}
+        <button class="btn small" data-act="ladderOn" data-i="${i}">+ Speed ladder</button>`;
+      } else {
+        const l = it.ladder;
+        html += `<div class="ladder-box">
+          <div class="row"><b>Speed ladder</b><span class="spacer"></span><button class="btn small" data-act="ladderOff" data-i="${i}">Remove ladder</button></div>
+          <div class="inline-fields">
+            <label class="field"><span>Start %</span><input type="number" inputmode="numeric" data-i="${i}" data-f="ladder.start" value="${esc(l.start)}"></label>
+            <label class="field"><span>End %</span><input type="number" inputmode="numeric" data-i="${i}" data-f="ladder.end" value="${esc(l.end)}"></label>
+            <label class="field"><span>Step %</span><input type="number" inputmode="numeric" data-i="${i}" data-f="ladder.step" value="${esc(l.step)}"></label>
+          </div>
+          <div class="inline-fields">
+            <label class="field"><span>Each step</span><input type="number" inputmode="numeric" data-i="${i}" data-f="ladder.amount" value="${esc(l.amount)}"></label>
+            <label class="field"><span>Measured in</span><select data-i="${i}" data-f="ladder.mode">
+              <option value="loops" ${l.mode !== 'time' ? 'selected' : ''}>loops</option>
+              <option value="time" ${l.mode === 'time' ? 'selected' : ''}>seconds</option>
+            </select></label>
+            <label class="field"><span>Break (s)</span><input type="number" inputmode="numeric" data-i="${i}" data-f="ladder.breakSec" value="${esc(l.breakSec)}"></label>
+          </div>
+          <div class="muted" id="ladderInfo${i}">${ladderInfoText(it)}</div>
+        </div>
+        ${rewindSel}`;
+      }
+    } else if (!it.ladder) {
+      const mins = Math.floor(num(it.duration, 60) / 60), secs = Math.round(num(it.duration, 60) % 60);
       html += `<div class="inline-fields">
         <label class="field"><span>BPM</span><input type="number" inputmode="numeric" data-i="${i}" data-f="bpm" value="${esc(it.bpm)}"></label>
         <label class="field"><span>Min</span><input type="number" inputmode="numeric" data-i="${i}" data-f="min" value="${mins}"></label>
@@ -804,7 +1233,6 @@ function renderRoutineEditor() {
       <button class="btn small" data-act="ladderOn" data-i="${i}">+ Speed ladder</button>`;
     } else {
       const l = it.ladder;
-      const steps = ladderSteps(l);
       html += `<div class="ladder-box">
         <div class="row"><b>Speed ladder</b><span class="spacer"></span><button class="btn small" data-act="ladderOff" data-i="${i}">Remove ladder</button></div>
         <div class="inline-fields">
@@ -820,13 +1248,14 @@ function renderRoutineEditor() {
           </select></label>
           <label class="field"><span>Break (s)</span><input type="number" inputmode="numeric" data-i="${i}" data-f="ladder.breakSec" value="${esc(l.breakSec)}"></label>
         </div>
-        <div class="muted" id="ladderInfo${i}">${steps.length} steps: ${steps.join(' → ')}</div>
+        <div class="muted" id="ladderInfo${i}">${ladderInfoText(it)}</div>
       </div>`;
     }
     html += `</div>`;
   });
-  html += `<h2>Add an exercise</h2>
-    <div class="row"><select id="addSel" style="flex:1">${exOptions}</select><button class="btn primary" data-act="add">Add</button></div>
+  html += `<h2>Add to routine</h2>
+    <div class="row"><select id="addSel" style="flex:1">${addOptions}</select><button class="btn primary" data-act="add">Add</button></div>
+    ${songs.length ? '' : '<p class="muted">Import songs in the Songs tab to add them here.</p>'}
     <div class="row" style="margin-top:28px">
       <button class="btn primary" data-act="save" style="flex:1">Save routine</button>
     </div>
@@ -837,11 +1266,12 @@ function renderRoutineEditor() {
 
 $('view').addEventListener('input', e => {
   const el = e.target;
-  if (draft && el.dataset.f && $('view').contains(el)) updateDraftField(el);
+  if (draft && el.dataset.f) updateDraftField(el);
+  else if (songDraft && (el.dataset.sf || el.dataset.si !== undefined)) updateSongField(el);
 });
 $('view').addEventListener('change', e => {
   const el = e.target;
-  if (draft && el.dataset.f && el.tagName === 'SELECT') { updateDraftField(el); }
+  if (draft && el.dataset.f && el.tagName === 'SELECT') updateDraftField(el);
 });
 
 function updateDraftField(el) {
@@ -853,6 +1283,10 @@ function updateDraftField(el) {
     const it = draft.items[+i];
     if (!it) return;
     if (f === 'bpm') it.bpm = clamp(num(el.value, 80), 20, 400);
+    else if (f === 'speed') it.speed = clamp(num(el.value, 100), 25, 150);
+    else if (f === 'amount') it.amount = Math.max(1, Math.round(num(el.value, 4)));
+    else if (f === 'mode') it.mode = el.value;
+    else if (f === 'rewind') it.rewind = num(el.value, 15);
     else if (f === 'min' || f === 'sec') {
       const box = el.closest('.item');
       const m = num(box.querySelector('[data-f=min]').value, 0);
@@ -862,7 +1296,7 @@ function updateDraftField(el) {
       const k = f.slice(7);
       it.ladder[k] = k === 'mode' ? el.value : num(el.value, it.ladder[k]);
       const info = document.getElementById('ladderInfo' + i);
-      if (info) { const st = ladderSteps(it.ladder); info.textContent = `${st.length} steps: ${st.join(' → ')}`; }
+      if (info) info.textContent = ladderInfoText(it);
     }
   }
   const tt = $('totalTime');
@@ -871,41 +1305,48 @@ function updateDraftField(el) {
 
 $('view').addEventListener('click', e => {
   const b = e.target.closest('[data-act]');
-  if (!b) return;
+  if (!b || !draft) return;
   const act = b.dataset.act, i = +b.dataset.i;
-  if (draft) {
-    if (act === 'cancel') { draft = null; showTab('routines'); return; }
-    if (act === 'up' && i > 0) { [draft.items[i - 1], draft.items[i]] = [draft.items[i], draft.items[i - 1]]; }
-    if (act === 'down' && i < draft.items.length - 1) { [draft.items[i + 1], draft.items[i]] = [draft.items[i], draft.items[i + 1]]; }
-    if (act === 'remove') draft.items.splice(i, 1);
-    if (act === 'ladderOn') draft.items[i].ladder = defaultLadder(num(draft.items[i].bpm, 80));
-    if (act === 'ladderOff') draft.items[i].ladder = null;
-    if (act === 'add') {
-      const ex = findEx($('addSel').value);
+  if (act === 'cancel') { draft = null; showTab('routines'); return; }
+  if (act === 'up' && i > 0) { [draft.items[i - 1], draft.items[i]] = [draft.items[i], draft.items[i - 1]]; }
+  if (act === 'down' && i < draft.items.length - 1) { [draft.items[i + 1], draft.items[i]] = [draft.items[i], draft.items[i + 1]]; }
+  if (act === 'remove') draft.items.splice(i, 1);
+  if (act === 'ladderOn') draft.items[i].ladder = isSongItem(draft.items[i]) ? defaultSongLadder() : defaultLadder(num(draft.items[i].bpm, 80));
+  if (act === 'ladderOff') draft.items[i].ladder = null;
+  if (act === 'add') {
+    const val = $('addSel').value || '';
+    if (val.startsWith('ex:')) {
+      const ex = findEx(val.slice(3));
       if (ex) draft.items.push({ exId: ex.id, name: ex.name, bpm: ex.bpm, duration: ex.duration, ladder: null });
+    } else if (val.startsWith('song:')) {
+      const [, songId, sectionId] = val.split(':');
+      const song = findSong(songId), sec = findSection(song, sectionId);
+      if (song && sec) {
+        const full = sec.end - sec.start > 90;
+        draft.items.push({ type: 'song', songId, sectionId, speed: 100, mode: full ? 'time' : 'loops', amount: full ? 120 : 4, rewind: 15, ladder: null });
+      }
     }
-    if (act === 'save') {
-      if (!draft.name.trim()) { toast('Give the routine a name'); return; }
-      draft.items.forEach(it => { const ex = findEx(it.exId); if (ex) it.name = ex.name; });
-      if (draft.id) { const k = routines.findIndex(r => r.id === draft.id); routines[k] = draft; }
-      else { draft.id = uid(); routines.push(draft); }
-      saveRoutines(); draft = null; toast('Routine saved'); showTab('routines'); return;
-    }
-    if (act === 'duplicate') {
-      const copy = JSON.parse(JSON.stringify(draft)); copy.id = uid(); copy.name += ' (copy)';
-      routines.push(copy); saveRoutines(); draft = null; toast('Duplicated'); showTab('routines'); return;
-    }
-    if (act === 'delete') {
-      if (!confirm(`Delete "${draft.name}"?`)) return;
-      routines = routines.filter(r => r.id !== draft.id); saveRoutines(); draft = null; showTab('routines'); return;
-    }
-    renderRoutineEditor();
   }
+  if (act === 'save') {
+    if (!draft.name.trim()) { toast('Give the routine a name'); return; }
+    draft.items.forEach(it => { if (!isSongItem(it)) { const ex = findEx(it.exId); if (ex) it.name = ex.name; } });
+    if (draft.id) { const k = routines.findIndex(r => r.id === draft.id); routines[k] = draft; }
+    else { draft.id = uid(); routines.push(draft); }
+    saveRoutines(); draft = null; toast('Routine saved'); showTab('routines'); return;
+  }
+  if (act === 'duplicate') {
+    const copy = JSON.parse(JSON.stringify(draft)); copy.id = uid(); copy.name += ' (copy)';
+    routines.push(copy); saveRoutines(); draft = null; toast('Duplicated'); showTab('routines'); return;
+  }
+  if (act === 'delete') {
+    if (!confirm(`Delete "${draft.name}"?`)) return;
+    routines = routines.filter(r => r.id !== draft.id); saveRoutines(); draft = null; showTab('routines'); return;
+  }
+  renderRoutineEditor();
 });
 
 /* ---------- Exercise library ---------- */
 function renderExercises() {
-  draft = null;
   const v = $('view');
   let html = `<h1>Exercises</h1>`;
   if (!exercises.length) html += `<div class="empty">No exercises.</div>`;
@@ -958,14 +1399,310 @@ function editExercise(id) {
     saveExercises(); toast('Exercise saved'); renderExercises();
   });
   if (id) $('exDel').addEventListener('click', () => {
-    const used = routines.filter(r => r.items.some(it => it.exId === id)).map(r => r.name);
+    const used = routines.filter(r => r.items.some(it => !isSongItem(it) && it.exId === id)).map(r => r.name);
     const msg = used.length ? `"${exDraft.name}" is used in: ${used.join(', ')}. Delete it and remove it from those routines?` : `Delete "${exDraft.name}"?`;
     if (!confirm(msg)) return;
     exercises = exercises.filter(x => x.id !== id);
-    routines.forEach(r => { r.items = r.items.filter(it => it.exId !== id); });
+    routines.forEach(r => { r.items = r.items.filter(it => isSongItem(it) || it.exId !== id); });
     saveExercises(); saveRoutines(); renderExercises();
   });
 }
+
+/* ---------- Songs ---------- */
+function renderSongs() {
+  const v = $('view');
+  let html = `<h1>Songs</h1>`;
+  if (!songs.length) html += `<div class="empty">No songs yet. Import an MP3 from your Files or iCloud Drive.</div>`;
+  for (const s of songs) {
+    const missing = !audioIds.has(s.id);
+    html += `<div class="card">
+      <div class="row"><div class="title" style="flex:1">🎵 ${esc(s.name)}</div><button class="btn small" data-songedit="${s.id}">Edit</button></div>
+      <div class="meta">${fmtPos(s.duration)} · ${s.sections.length} section${s.sections.length === 1 ? '' : 's'}${s.bpm ? ' · ' + s.bpm + ' BPM' : ''}</div>
+      <div class="meta">${s.sections.map(x => esc(x.name)).join(' · ')}</div>
+      ${missing ? '<div class="meta warn">⚠ Audio file missing — tap Edit, then Replace audio file</div>' : ''}
+    </div>`;
+  }
+  html += `<button class="btn wide primary" id="importSong">+ Import song</button>
+    <input type="file" id="songFile" accept="audio/*,.mp3,.m4a,.aac,.wav" hidden>
+    <p class="muted" style="margin-top:16px">Songs are stored on this phone only. Backups save your song sections and settings, but not the audio files themselves.</p>`;
+  v.innerHTML = html;
+  v.querySelectorAll('[data-songedit]').forEach(b => b.addEventListener('click', () => editSong(b.dataset.songedit)));
+  $('importSong').addEventListener('click', () => $('songFile').click());
+  $('songFile').addEventListener('change', async e => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (file) await importSongFile(file);
+  });
+}
+
+async function storeAudio(id, file) {
+  const data = await file.arrayBuffer();
+  await DB.put(id, { type: file.type || 'audio/mpeg', data, name: file.name });
+  audioIds.add(id);
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
+}
+
+function probeDuration(id) {
+  return getSongUrl(id).then(url => new Promise(res => {
+    if (!url) return res(0);
+    const a = new Audio();
+    a.preload = 'metadata';
+    let done = false;
+    const fin = d => { if (done) return; done = true; res(isFinite(d) && d > 0 ? d : 0); a.removeAttribute('src'); };
+    a.addEventListener('loadedmetadata', () => fin(a.duration));
+    a.addEventListener('error', () => fin(0));
+    setTimeout(() => fin(a.duration), 6000);
+    a.src = url;
+    try { a.load(); } catch (e) {}
+  }));
+}
+
+async function importSongFile(file) {
+  toast('Importing…');
+  try {
+    const id = uid();
+    await storeAudio(id, file);
+    const dur = round1(await probeDuration(id));
+    const song = {
+      id, name: file.name.replace(/\.[^.]+$/, ''), bpm: null, duration: dur,
+      sections: [{ id: uid(), name: 'Full track', start: 0, end: dur }]
+    };
+    songs.push(song); saveSongs();
+    toast('Song imported');
+    editSong(id);
+  } catch (err) {
+    toast('Could not import that file — the phone may be out of space');
+  }
+}
+
+let edRaf = 0, previewEnd = null, scrubbing = false;
+function stopEditor() {
+  cancelAnimationFrame(edRaf); edRaf = 0;
+  previewEnd = null;
+  if (!S.active) songEl.pause();
+}
+
+async function editSong(id) {
+  const s = findSong(id);
+  if (!s) return;
+  stopEditor();
+  draft = null;
+  songDraft = JSON.parse(JSON.stringify(s));
+  renderSongEditor();
+  if (audioIds.has(id)) {
+    songEl.muted = false;
+    const ok = await loadSongInto(id);
+    if (ok && songDraft && songDraft.id === id) {
+      const d = songEl.duration;
+      if (isFinite(d) && d > 0 && Math.abs(d - songDraft.duration) > 0.2) {
+        // Fix up the length if it wasn't known at import
+        const old = songDraft.duration;
+        songDraft.duration = round1(d);
+        songDraft.sections.forEach(x => { if (!x.end || x.end > d || (x.end === old && x.start === 0)) x.end = round1(d); });
+        renderSongEditor();
+      }
+    }
+  }
+  const loop = () => { editorTick(); edRaf = requestAnimationFrame(loop); };
+  edRaf = requestAnimationFrame(loop);
+}
+
+function timeFields(prefix, j, t) {
+  const m = Math.floor(t / 60), s = round1(t - m * 60);
+  return `<label class="field"><span>Min</span><input type="number" inputmode="numeric" data-si="${j}" data-f="${prefix}m" value="${m}"></label>
+          <label class="field"><span>Sec</span><input type="number" inputmode="decimal" step="0.1" data-si="${j}" data-f="${prefix}s" value="${s}"></label>`;
+}
+
+function renderSongEditor() {
+  const s = songDraft, v = $('view');
+  const has = audioIds.has(s.id);
+  const dur = s.duration || 0;
+  let html = `<div class="row"><button class="btn small" data-sact="back">‹ Back</button></div>
+    <h1>Edit song</h1>
+    <label class="field"><span>Song name</span><input type="text" data-sf="name" value="${esc(s.name)}"></label>
+    <label class="field"><span>Song BPM (optional)</span><input type="number" inputmode="numeric" data-sf="bpm" value="${s.bpm || ''}" placeholder="Leave blank for a spoken 3, 2, 1"></label>
+    <p class="muted">With a BPM, the count-in clicks at the song's tempo (adjusted for the speed you choose). Without one, the voice counts "3, 2, 1".</p>
+    <h2>Player</h2>`;
+  if (has) {
+    html += `<div class="card">
+      <div class="ptime" id="pTime">0:00.0 / ${fmtTenths(dur)}</div>
+      <input type="range" id="pScrub" min="0" max="${dur}" step="0.1" value="0">
+      <div class="row player-btns">
+        <button class="btn" data-sact="back5">⏪ 5s</button>
+        <button class="btn primary" data-sact="play" id="pPlay">▶ Play</button>
+        <button class="btn" data-sact="fwd5">5s ⏩</button>
+      </div>
+      <p class="muted" style="margin-bottom:0">Play the song, then use "Start here" and "End here" to mark each section.</p>
+    </div>`;
+  } else {
+    html += `<div class="card"><div class="meta warn">⚠ This song's audio file isn't on this phone. Tap "Replace audio file" below to add it.</div></div>`;
+  }
+  html += `<h2>Sections</h2>`;
+  s.sections.forEach((sec, j) => {
+    html += `<div class="item songitem">
+      <div class="head">
+        <input type="text" class="secname" data-si="${j}" data-f="name" value="${esc(sec.name)}">
+        <button class="btn small danger" data-sact="delSec" data-j="${j}" aria-label="Delete section">✕</button>
+      </div>
+      <div class="muted" style="margin-top:8px">Start</div>
+      <div class="inline-fields">${timeFields('s', j, sec.start)}
+        ${has ? `<button class="btn small fit" data-sact="setStart" data-j="${j}">Start here</button>` : ''}</div>
+      <div class="muted">End</div>
+      <div class="inline-fields">${timeFields('e', j, sec.end)}
+        ${has ? `<button class="btn small fit" data-sact="setEnd" data-j="${j}">End here</button>` : ''}</div>
+      <div class="row">
+        <span class="muted" id="secLen${j}">Length ${fmtTenths(Math.max(0, sec.end - sec.start))}</span>
+        <span class="spacer"></span>
+        ${has ? `<button class="btn small" data-sact="playSec" data-j="${j}">▶ Play section</button>` : ''}
+      </div>
+    </div>`;
+  });
+  html += `${has ? '<button class="btn wide" data-sact="addSec">+ Add section (starts where the player is)</button>' : ''}
+    <button class="btn wide primary" data-sact="save" style="margin-top:20px">Save song</button>
+    <button class="btn wide" data-sact="replace">Replace audio file</button>
+    <input type="file" id="replaceFile" accept="audio/*,.mp3,.m4a,.aac,.wav" hidden>
+    <button class="btn wide danger" data-sact="delete">Delete song</button>`;
+  v.innerHTML = html;
+
+  const scrub = $('pScrub');
+  if (scrub) {
+    scrub.addEventListener('pointerdown', () => { scrubbing = true; });
+    scrub.addEventListener('pointerup', () => { scrubbing = false; });
+    scrub.addEventListener('input', () => { previewEnd = null; seekSong(num(scrub.value, 0)); });
+    scrub.addEventListener('change', () => { scrubbing = false; });
+  }
+  $('replaceFile').addEventListener('change', async e => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    try {
+      forgetSongUrl(songDraft.id);
+      await storeAudio(songDraft.id, file);
+      const d = round1(await probeDuration(songDraft.id));
+      if (d > 0) {
+        songDraft.duration = d;
+        songDraft.sections.forEach(x => { x.end = Math.min(x.end || d, d); if (x.start >= x.end) x.start = 0; });
+      }
+      toast('Audio replaced — remember to save');
+      editSongAfterReplace();
+    } catch (err) { toast('Could not load that file'); }
+  });
+}
+
+async function editSongAfterReplace() {
+  // keep unsaved edits, just reload the player
+  const keep = songDraft;
+  stopEditor();
+  songDraft = keep;
+  renderSongEditor();
+  await loadSongInto(keep.id);
+  const loop = () => { editorTick(); edRaf = requestAnimationFrame(loop); };
+  edRaf = requestAnimationFrame(loop);
+}
+
+function editorTick() {
+  if (!songDraft) return;
+  const t = songEl.currentTime || 0;
+  if (previewEnd != null && t >= previewEnd) { songEl.pause(); previewEnd = null; }
+  const pt = $('pTime');
+  if (pt) {
+    const txt = `${fmtTenths(t)} / ${fmtTenths(songDraft.duration)}`;
+    if (pt.textContent !== txt) pt.textContent = txt;
+  }
+  const sc = $('pScrub');
+  if (sc && !scrubbing) sc.value = t;
+  const pb = $('pPlay');
+  if (pb) {
+    const lbl = songEl.paused ? '▶ Play' : '❚❚ Pause';
+    if (pb.textContent !== lbl) pb.textContent = lbl;
+  }
+}
+
+function updateSongField(el) {
+  if (el.dataset.sf === 'name') { songDraft.name = el.value; return; }
+  if (el.dataset.sf === 'bpm') { const b = Math.round(num(el.value, 0)); songDraft.bpm = b >= 30 && b <= 300 ? b : null; return; }
+  const j = +el.dataset.si, sec = songDraft.sections[j], f = el.dataset.f;
+  if (!sec) return;
+  if (f === 'name') { sec.name = el.value; return; }
+  const box = el.closest('.item');
+  const read = p => num(box.querySelector(`[data-f=${p}m]`).value, 0) * 60 + num(box.querySelector(`[data-f=${p}s]`).value, 0);
+  if (f === 'sm' || f === 'ss') sec.start = round1(clamp(read('s'), 0, songDraft.duration || 1e6));
+  if (f === 'em' || f === 'es') sec.end = round1(clamp(read('e'), 0, songDraft.duration || 1e6));
+  const L = $('secLen' + j);
+  if (L) L.textContent = `Length ${fmtTenths(Math.max(0, sec.end - sec.start))}`;
+}
+
+$('view').addEventListener('click', async e => {
+  const b = e.target.closest('[data-sact]');
+  if (!b || !songDraft) return;
+  const act = b.dataset.sact, j = +b.dataset.j;
+  const s = songDraft, sec = s.sections[j];
+  const dur = s.duration || songEl.duration || 0;
+  const pos = round1(songEl.currentTime || 0);
+  const play = () => { try { const p = songEl.play(); if (p && p.catch) p.catch(() => {}); } catch (err) {} };
+  if (act === 'back') { showTab('songs'); return; }
+  if (act === 'play') {
+    songEl.playbackRate = 1;
+    if (songEl.paused) { previewEnd = null; play(); } else songEl.pause();
+    return;
+  }
+  if (act === 'back5') { seekSong(Math.max(0, songEl.currentTime - 5)); return; }
+  if (act === 'fwd5') { seekSong(Math.min(dur, songEl.currentTime + 5)); return; }
+  if (act === 'playSec' && sec) {
+    songEl.playbackRate = 1;
+    seekSong(sec.start); previewEnd = sec.end; play();
+    return;
+  }
+  if (act === 'setStart' && sec) {
+    sec.start = pos;
+    if (sec.end <= sec.start) sec.end = round1(Math.min(dur, sec.start + 10));
+  }
+  if (act === 'setEnd' && sec) {
+    if (pos <= sec.start) { toast('The end has to be after the start'); return; }
+    sec.end = pos;
+  }
+  if (act === 'addSec') {
+    s.sections.push({ id: uid(), name: 'Section ' + (s.sections.length + 1), start: pos, end: round1(Math.min(dur, pos + 30)) });
+  }
+  if (act === 'delSec') {
+    if (s.sections.length <= 1) { toast('A song needs at least one section'); return; }
+    const used = routines.some(r => r.items.some(it => isSongItem(it) && it.sectionId === sec.id));
+    if (!confirm(used ? `"${sec.name}" is used in a routine. Delete it and remove it from routines when you save?` : `Delete section "${sec.name}"?`)) return;
+    s.sections.splice(j, 1);
+  }
+  if (act === 'save') {
+    if (!s.name.trim()) { toast('Give the song a name'); return; }
+    for (const x of s.sections) {
+      if (!x.name.trim()) x.name = 'Section';
+      if (x.end - x.start < 0.5) { toast(`"${x.name}" needs an end after its start`); return; }
+    }
+    const k = songs.findIndex(x => x.id === s.id);
+    songs[k] = s;
+    const ids = new Set(s.sections.map(x => x.id));
+    routines.forEach(r => { r.items = r.items.filter(it => !(isSongItem(it) && it.songId === s.id && !ids.has(it.sectionId))); });
+    saveSongs(); saveRoutines();
+    toast('Song saved');
+    showTab('songs');
+    return;
+  }
+  if (act === 'replace') { $('replaceFile').click(); return; }
+  if (act === 'delete') {
+    const used = routines.filter(r => r.items.some(it => isSongItem(it) && it.songId === s.id)).map(r => r.name);
+    if (!confirm(used.length ? `"${s.name}" is used in: ${used.join(', ')}. Delete it and remove it from those routines?` : `Delete "${s.name}"?`)) return;
+    songs = songs.filter(x => x.id !== s.id);
+    routines.forEach(r => { r.items = r.items.filter(it => !(isSongItem(it) && it.songId === s.id)); });
+    forgetSongUrl(s.id);
+    try { await DB.del(s.id); } catch (err) {}
+    audioIds.delete(s.id);
+    saveSongs(); saveRoutines();
+    showTab('songs');
+    return;
+  }
+  // structural change: redraw, keeping the scroll position
+  const y = window.scrollY;
+  renderSongEditor();
+  window.scrollTo(0, y);
+});
 
 /* ---------- Settings ---------- */
 function fillVoiceSelect(sel) {
@@ -977,7 +1714,6 @@ function fillVoiceSelect(sel) {
 }
 
 function renderSettings() {
-  draft = null;
   const v = $('view');
   const chk = (k, label) => `<label class="toggle"><span>${label}</span><input type="checkbox" data-s="${k}" ${settings[k] ? 'checked' : ''}></label>`;
   v.innerHTML = `<h1>Settings</h1>
@@ -996,9 +1732,9 @@ function renderSettings() {
     <h2>Voice cues</h2>
     <div class="card">
       ${chk('voiceOn', 'Voice cues on')}
-      ${chk('cueNext', '"Next up: name, BPM, length"')}
+      ${chk('cueNext', '"Next up: name, speed, length"')}
       ${chk('cueTip', 'Read the exercise tip')}
-      ${chk('cue30', '"30 seconds left"')}
+      ${chk('cue30', '"30 seconds left" (exercises)')}
       ${chk('cueLadder', 'Speed ladder steps')}
       ${chk('cueDone', '"Session complete"')}
       <label class="field"><span>Voice</span><select id="voiceSel" data-s="voiceURI"></select></label>
@@ -1007,16 +1743,16 @@ function renderSettings() {
     </div>
     <h2>Session</h2>
     <div class="card">
-      <label class="field"><span>Get-ready time before the first exercise (seconds)</span><input type="number" inputmode="numeric" data-s="firstBreak" value="${settings.firstBreak}"></label>
+      <label class="field"><span>Get-ready time before the first item (seconds)</span><input type="number" inputmode="numeric" data-s="firstBreak" value="${settings.firstBreak}"></label>
     </div>
     <h2>Backup</h2>
     <div class="card">
-      <p class="muted" style="margin-top:0">Save your exercises, routines and settings to a small file, or load them back.</p>
+      <p class="muted" style="margin-top:0">Save your exercises, routines, song sections and settings to a small file, or load them back. Song audio files aren't included.</p>
       <button class="btn wide" id="exportBtn">Export backup</button>
       <button class="btn wide" id="importBtn">Import backup</button>
       <input type="file" id="importFile" accept=".json,application/json" hidden>
     </div>
-    <p class="muted" style="text-align:center;margin-top:24px">Roadie · Phase 1</p>`;
+    <p class="muted" style="text-align:center;margin-top:24px">Roadie · Phase 2</p>`;
   fillVoiceSelect($('voiceSel'));
 
   v.querySelectorAll('[data-s]').forEach(el => {
@@ -1040,6 +1776,7 @@ function renderSettings() {
     for (let k = 0; k < settings.beatsPerBar; k++) playClick(t + k * iv, k === 0);
   });
   $('testVoice').addEventListener('click', () => {
+    if (ctx && ctx.state === 'running') ctx.suspend();
     unlockSpeech();
     const was = settings.voiceOn; settings.voiceOn = true;
     speak('Next up: Chromatic Spider, 80 BPM, 2 minutes.');
@@ -1052,7 +1789,7 @@ function renderSettings() {
 
 /* ---------- Export / import ---------- */
 async function exportBackup() {
-  const data = { app: 'roadie', version: 1, exported: new Date().toISOString(), settings, exercises, routines };
+  const data = { app: 'roadie', version: 2, exported: new Date().toISOString(), settings, exercises, routines, songs };
   const json = JSON.stringify(data, null, 2);
   const name = `roadie-backup-${new Date().toISOString().slice(0, 10)}.json`;
   try {
@@ -1080,11 +1817,13 @@ function importBackup(e) {
     try {
       const data = JSON.parse(reader.result);
       if (data.app !== 'roadie' || !Array.isArray(data.exercises) || !Array.isArray(data.routines)) throw new Error('bad');
-      if (!confirm(`Replace your current exercises, routines and settings with this backup (${data.exercises.length} exercises, ${data.routines.length} routines)?`)) return;
-      exercises = data.exercises; routines = data.routines;
+      const incomingSongs = Array.isArray(data.songs) ? data.songs : [];
+      if (!confirm(`Replace your current exercises, routines, songs and settings with this backup (${data.exercises.length} exercises, ${data.routines.length} routines, ${incomingSongs.length} songs)?`)) return;
+      exercises = data.exercises; routines = data.routines; songs = incomingSongs;
       settings = Object.assign({}, DEFAULT_SETTINGS, data.settings || {});
-      saveExercises(); saveRoutines(); saveSettings();
-      toast('Backup imported');
+      saveExercises(); saveRoutines(); saveSongs(); saveSettings();
+      const missing = songs.filter(s => !audioIds.has(s.id)).length;
+      toast(missing ? `Backup imported — ${missing} song${missing === 1 ? ' needs its' : 's need their'} audio re-added in Songs` : 'Backup imported');
       renderSettings();
     } catch (err) {
       toast("That file doesn't look like a Roadie backup");
@@ -1097,6 +1836,10 @@ function importBackup(e) {
    Start up
    ========================================================= */
 showTab('routines');
+DB.keys().then(keys => {
+  audioIds = new Set(keys);
+  if (currentTab === 'songs' && !songDraft) renderSongs();
+}).catch(() => {});
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
