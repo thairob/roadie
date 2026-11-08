@@ -198,6 +198,81 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 }
 .pause-row { display: flex; gap: 2vw; flex-wrap: wrap; justify-content: center; }
 
+/* Board mode (scale guide and triads): the fretboard fills the screen */
+#s-board, #s-mini, #s-caption { display: none; }
+#session.board #s-hint-left, #session.board #s-hint-right, #session.board #s-next, #session.board #s-progress { display: none; }
+#session.board #s-top { text-align: left; padding-right: 22vw; }
+#session.board #s-name { font-size: 8vh; }
+#session.board #s-sub { font-size: 5vh; margin-top: 0; }
+#session.board #s-big {
+  position: absolute; top: calc(var(--safe-t) + 1.5vh); right: calc(var(--safe-r) + 3vw);
+  margin: 0; font-size: 12vh; text-align: right; z-index: 3;
+}
+#session.board #s-big.break { font-size: 12vh; }
+#session.board #s-big .lbl { font-size: 3.2vh; }
+#session.board #s-beats { position: absolute; top: calc(var(--safe-t) + 17vh); right: calc(var(--safe-r) + 3vw); margin: 0; gap: 1vw; }
+#session.board #s-beats span { width: 2.6vh; height: 2.6vh; }
+#session.board #s-board {
+  display: block; position: absolute;
+  left: calc(var(--safe-l) + 1.5vw); right: calc(var(--safe-r) + 1.5vw);
+  top: calc(var(--safe-t) + 21vh); height: 58vh;
+}
+#session.board #s-board svg, #session.board #s-mini svg { width: 100%; height: 100%; display: block; }
+#session.board #s-mini {
+  display: block; position: absolute; left: 22vw; right: 22vw;
+  bottom: calc(var(--safe-b) + 1.5vh); height: 12vh;
+}
+#session.board #s-mini:empty { display: none; }
+#session.board #s-caption {
+  display: block; position: absolute; left: 0; right: 0; bottom: calc(var(--safe-b) + 2vh);
+  text-align: center; font-size: 6vh; font-weight: 800; color: var(--text); pointer-events: none;
+}
+#session.board #s-mini:not(:empty) ~ #s-caption { display: none; }
+#session.board.scale-cap #s-caption { display: block; }
+
+/* Fretboard colours */
+.fb-wood { fill: #17130f; }
+.fb-fret { stroke: #6b6f78; stroke-width: 3; }
+.fb-nut { stroke: #e8e2d4; stroke-width: 9; }
+.fb-string { stroke: #b9bcc4; }
+.fb-string.off { stroke: #4a4c52; }
+.fb-inlay { fill: #3a342c; }
+.fb-num { fill: #8f95a1; font-size: 24px; font-weight: 700; text-anchor: middle; font-family: -apple-system, sans-serif; }
+.n circle { fill: #2f3644; stroke: #8b95a8; stroke-width: 2.5; }
+.n text { fill: #d5dae3; font-weight: 800; text-anchor: middle; font-family: -apple-system, sans-serif; }
+.n.root circle { fill: #e2483d; stroke: #ff8a7f; stroke-width: 3; }
+.n.root text { fill: #fff; }
+.n.tri circle { fill: #f2f4f8; stroke: #fff; }
+.n.tri text { fill: #111; }
+.n.cur circle { fill: #ffffff; stroke: var(--accent); stroke-width: 6; filter: drop-shadow(0 0 10px #ffd27a) drop-shadow(0 0 22px #ffb020); }
+.n.cur text { fill: #111; }
+.n.root.cur circle { fill: #ff6a5c; stroke: #fff; }
+.n.root.cur text { fill: #fff; }
+.n.ghost circle { fill: none; stroke: #ffb020; stroke-width: 3; stroke-dasharray: 7 6; opacity: 0.85; }
+.n.ghost text { fill: #ffb020; opacity: 0.85; }
+.mini-win { fill: rgba(255,176,32,0.18); stroke: var(--accent); stroke-width: 3; }
+.mini-string { stroke: #444851; stroke-width: 1.5; }
+.mini-fret { stroke: #2c2f36; stroke-width: 1.5; }
+.mini-nut { stroke: #8a8f99; stroke-width: 4; }
+.mini-note { fill: #6d7482; }
+.mini-root { fill: #e2483d; }
+
+/* Key picker: tappable circle of 12 */
+.keycircle { position: relative; width: 270px; height: 270px; margin: 6px auto 10px; }
+.keycircle .kc {
+  position: absolute; transform: translate(-50%, -50%);
+  width: 52px; height: 52px; border-radius: 50%;
+  background: #0f0f12; border: 2px solid var(--line); font-weight: 800; font-size: 17px;
+}
+.keycircle .kc.on { background: var(--accent); color: #111; border-color: var(--accent); }
+.keycircle .kc-mid {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  color: var(--dim); font-size: 15px; text-align: center; width: 120px;
+}
+.keycircle .kc-mid b { display: block; color: var(--text); font-size: 30px; }
+.item.boarditem { border-left-color: #b07cff; }
+.toggle.compact { padding: 8px 0; border-bottom: 0; }
+
 #paused, #done {
   position: absolute; inset: 0; z-index: 20;
   background: rgba(0,0,0,0.88);
