@@ -129,7 +129,9 @@ function ensureAudio(rebuild) {
     ctx = new AC();
     // If iPhone interrupts the sound (for example while the voice talks), try to bring it straight back
     ctx.onstatechange = () => {
-      if (ctx && ctx.state !== 'running' && ctx.state !== 'closed' && S.active) {
+      // Never grab the speaker back while the voice is talking, or iPhone silences the voice
+      if (ctx && ctx.state !== 'running' && ctx.state !== 'closed' && S.active &&
+          (S.phase === 'countin' || S.phase === 'play') && !speechBusy()) {
         try { ctx.resume(); } catch (e) {}
       }
     };
@@ -245,10 +247,16 @@ function pickVoice() {
   if (!voices.length) voices = speechSynthesis.getVoices() || [];
   return voices.find(v => v.voiceURI === settings.voiceURI) || null;
 }
-let speechToken = 0;
+let speechToken = 0, speaking = false;
+function speechBusy() {
+  return speaking || ('speechSynthesis' in window && (speechSynthesis.speaking || speechSynthesis.pending));
+}
 function speak(text, onDone) {
   const token = ++speechToken;
-  const finish = () => { if (token === speechToken && onDone) { const f = onDone; onDone = null; f(); } };
+  const finish = () => {
+    if (token === speechToken) speaking = false;
+    if (token === speechToken && onDone) { const f = onDone; onDone = null; f(); }
+  };
   if (!settings.voiceOn || !text || !('speechSynthesis' in window)) { setTimeout(finish, 0); return; }
   if (speechSynthesis.speaking || speechSynthesis.pending) speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
@@ -256,10 +264,13 @@ function speak(text, onDone) {
   if (v) { u.voice = v; u.lang = v.lang; } else { u.lang = 'en-US'; }
   u.rate = settings.voiceRate;
   u.onend = finish; u.onerror = finish;
+  speaking = true;
+  setTimeout(() => { if (token === speechToken) speaking = false; }, 15000);  // safety net
   speechSynthesis.speak(u);
 }
 function stopSpeech() {
   speechToken++;
+  speaking = false;
   if ('speechSynthesis' in window && (speechSynthesis.speaking || speechSynthesis.pending)) speechSynthesis.cancel();
 }
 function unlockSpeech() {
@@ -399,7 +410,19 @@ function enterBreak(i) {
   S.speechDone = false;
   S.speechStartedAt = now();
   const text = announcement(seg);
-  speak(text, () => { S.speechDone = true; });
+  // Take turns: pause Roadie's own sound so iPhone lets the voice through,
+  // then the sound is switched back on before the count-in.
+  const breakToken = S.breakToken = (S.breakToken || 0) + 1;
+  const talk = () => {
+    if (S.breakToken !== breakToken || S.phase !== 'break') return;
+    S.speechStartedAt = now();
+    speak(text, () => { S.speechDone = true; });
+  };
+  if (text && settings.voiceOn && ctx && ctx.state === 'running') {
+    ctx.suspend().then(talk, talk);
+  } else {
+    talk();
+  }
   render();
 }
 
@@ -429,7 +452,7 @@ function tick() {
   if (!S.active) return;
   Metro.poll();
   const t = now();
-  const soundOff = !!ctx && ctx.state !== 'running' && (S.phase === 'countin' || S.phase === 'play');
+  const soundOff = !!ctx && ctx.state !== 'running' && (S.phase === 'countin' || S.phase === 'play') && !speechBusy();
   if (soundOff && t - (S.lastResume || 0) > 1) {
     S.lastResume = t;
     try { ctx.resume(); } catch (e) {}
