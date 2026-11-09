@@ -15,6 +15,19 @@ const LS = {
     catch (e) { toast('Could not save — storage full?'); }
   }
 };
+// Problem log: anything that goes wrong is noted (newest first) so Rob can copy it and send it over
+function logProblem(where, err) {
+  try {
+    const list = LS.get('problems', []);
+    const msg = err && err.message ? err.message : String(err);
+    const line = err && err.stack ? String(err.stack).split('\n').slice(0, 2).join(' | ') : '';
+    list.unshift({ when: new Date().toLocaleString(), where, msg, line });
+    LS.set('problems', list.slice(0, 10));
+  } catch (e) {}
+}
+window.addEventListener('error', e => logProblem('page', e.error || e.message));
+window.addEventListener('unhandledrejection', e => logProblem('promise', e.reason));
+
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
 const num = (v, d) => { const n = parseFloat(v); return isFinite(n) ? n : d; };
@@ -357,7 +370,7 @@ const Metro = {
       }
       const accent = this.beat < 0 ? this.beat === -this.countIn : (this.beat % bpb === 0);
       if (!(this.quiet && this.beat >= 0)) playClick(this.nextTime, accent);
-      if (this.onSchedule) this.onSchedule(this.beat, this.nextTime);
+      if (this.onSchedule) { try { this.onSchedule(this.beat, this.nextTime); } catch (e) { logProblem('sound', e); } }
       this.queue.push({ time: this.nextTime, beat: this.beat, accent });
       this.nextTime += interval;
       this.beat++;
@@ -368,7 +381,7 @@ const Metro = {
     if (!ctx) return;
     while (this.queue.length && this.queue[0].time <= ctx.currentTime) {
       const b = this.queue.shift();
-      if (this.onBeat) this.onBeat(b);
+      if (this.onBeat) { try { this.onBeat(b); } catch (e) { logProblem('beat', e); } }
     }
   }
 };
@@ -576,6 +589,12 @@ function songSegment(item, idx, song, sec, pct, mode, amount) {
 }
 
 /* ---------- Scale guide and triad segments (Phase 3) ---------- */
+// Positions are 1–5, or 'open' for open position
+const posValue = v => v === 'open' ? 'open' : clamp(Math.round(num(v, 1)), 1, 5);
+const posLabel = p => p === 'open' ? 'Open position' : `Position ${p}`;
+const posLower = p => p === 'open' ? 'open position' : `position ${p}`;
+const posShort = p => p === 'open' ? 'open' : `pos ${p}`;
+
 const BOARD_KINDS = ['scale', 'triadWalk', 'triadQuiz', 'noteFind', 'callResp', 'prog'];
 const PROG_MODES = { play: 'play along', tones: 'chord tones', triads: 'triads' };
 
@@ -604,7 +623,7 @@ function progSegments(item, idx, brk) {
     seg.shapes = shapes;
   } else if (mode === 'tones') {
     seg.scale = Theory.SCALES[item.scale] ? item.scale : pr.scale;
-    seg.p = clamp(Math.round(num(item.p, 1)), 1, 5);
+    seg.p = posValue(item.p);
     seg.pos = Theory.position(key, seg.scale, seg.p);
   } else {
     seg.set = Theory.STRING_SETS[item.strings] ? item.strings : 'gbe';
@@ -735,7 +754,7 @@ function noteFindSegments(item, idx, brk) {
 function callRespSegments(item, idx, brk) {
   const scale = Theory.SCALES[item.scale] ? item.scale : 'minPent';
   const key = Theory.pcOf(num(item.key, 9));
-  const p = clamp(Math.round(num(item.p, 1)), 1, 5);
+  const p = posValue(item.p);
   const bpm = clamp(Math.round(num(item.bpm, 70)), 20, 300);
   const bpb = settings.beatsPerBar;
   const n = clamp(Math.round(num(item.prompts, 10)), 1, 60);
@@ -787,7 +806,7 @@ function scaleSegments(item, idx, brk) {
   const key = Theory.pcOf(num(item.key, 9));
   const bpm = clamp(Math.round(num(item.bpm, 80)), 20, 300);
   const rounds = clamp(Math.round(num(item.rounds, 2)), 1, 8);
-  const list = item.positions === 'all' || item.positions == null ? [1, 2, 3, 4, 5] : [clamp(Math.round(num(item.positions, 1)), 1, 5)];
+  const list = item.positions === 'all' || item.positions == null ? [1, 2, 3, 4, 5] : [posValue(item.positions)];
   return list.map((p, k) => {
     const pos = Theory.position(key, scale, p);
     const path = Theory.scalePath(pos.notes, rounds);
@@ -850,19 +869,19 @@ function triadSegments(item, idx, brk) {
 function boardAnnouncement(seg) {
   if (!settings.cueNext) return '';
   if (seg.kind === 'scale') {
-    if (seg.posIdx > 0) return `Position ${seg.p}.`;
-    return `Next up: ${seg.spokenName}, ${seg.all ? 'all 5 positions' : 'position ' + seg.p}, ${seg.bpm} BPM.`;
+    if (seg.posIdx > 0) return `${posLabel(seg.p)}.`;
+    return `Next up: ${seg.spokenName}, ${seg.all ? 'all 5 positions' : posLower(seg.p)}, ${seg.bpm} BPM.`;
   }
   if (seg.kind === 'prog') {
     const list = Theory.progChordList(seg.key, seg.progId).map(c => c.spoken);
     const chords = list.length > 1 ? list.slice(0, -1).join(', ') + ' and ' + list[list.length - 1] : list[0];
     const what = seg.mode === 'play' ? 'Play along with the power chords.'
-      : seg.mode === 'tones' ? `Improvise in position ${seg.p}, and aim for the notes of each chord.`
+      : seg.mode === 'tones' ? `Improvise in ${posLower(seg.p)}, and aim for the notes of each chord.`
       : `Follow the triad shapes on the ${Theory.STRING_SETS[seg.set].spoken}.`;
     return `Next up: ${seg.spokenName}, ${seg.bpm} BPM. The chords are ${chords}. ${what}`;
   }
   if (seg.kind === 'noteFind') return `Next up: note finder, ${seg.prompts.length} notes. Find each one before it appears.`;
-  if (seg.kind === 'callResp') return `Next up: call and response in ${seg.spokenTitle}, position ${seg.p}. Listen, then play it back.`;
+  if (seg.kind === 'callResp') return `Next up: call and response in ${seg.spokenTitle}, ${posLower(seg.p)}. Listen, then play it back.`;
   const strings = Theory.STRING_SETS[seg.set].spoken;
   if (seg.kind === 'triadQuiz') return `Next up: triad quiz, ${seg.prompts.length} triads on the ${strings}. Find each one before it appears.`;
   const name = `${Theory.spokenNote(seg.key)} ${seg.quality}`;
@@ -1025,6 +1044,7 @@ async function startSession(routineId) {
 
 function enterBreak(i) {
   Metro.stop(); stopSpeech();
+  S.clockMode = false;
   songEl.pause();
   S.i = i; S.phase = 'break';
   const seg = S.segs[i];
@@ -1074,6 +1094,7 @@ function prepareSong(seg, pos) {
 
 function enterCountIn(remaining, songState) {
   Metro.stop(); stopSpeech();
+  S.clockMode = false; S.lastCt = null; S.lastCtAt = now();
   const seg = curSeg();
   S.phase = 'countin';
   S.segRemaining = remaining;
@@ -1175,7 +1196,46 @@ function currentRemaining() {
   return seg.duration;
 }
 
+// The session clock: never let an error stop it
 function tick() {
+  try { tickInner(); }
+  catch (e) {
+    if (!tick._last || performance.now() - tick._last > 5000) { logProblem('timer', e); tick._last = performance.now(); }
+  }
+}
+
+/* If iPhone leaves the sound switched off (the audio clock stops moving), keep the drill
+   going on the phone's normal clock, then pick the click back up when the sound returns. */
+function watchAudio(seg, t) {
+  const ct = ctx ? ctx.currentTime : 0;
+  if (speechBusy()) S.lastSpeechAt = t;
+  if (ct !== S.lastCt) {
+    const advancing = S.lastCt != null && ct > S.lastCt;
+    S.lastCt = ct; S.lastCtAt = t;
+    if (S.clockMode && advancing && ctx && ctx.state === 'running') leaveClockMode(seg);
+    return;
+  }
+  if (!S.clockMode && t - Math.max(S.lastCtAt || 0, S.lastSpeechAt || 0, S.playStart) > 1.6) {
+    Metro.stop();
+    S.clockMode = true;
+    S.clockBase = Math.max(S.boardStep || 0, S.stepBase) + 1;
+    S.clockStart = t;
+    logProblem('sound', `Sound stopped during "${seg.name}" (audio ${ctx ? ctx.state : 'none'}) — kept going on the phone clock`);
+  }
+}
+function clockStep(seg, t) {
+  const step = S.clockBase + Math.floor((t - S.clockStart) * seg.bpm / 60);
+  if (step >= seg.totalSteps) { S.clockMode = false; endSegment(); return; }
+  if (step !== S.boardStep) { S.boardStep = step; boardCue(seg, step); showBoard(seg); }
+}
+function leaveClockMode(seg) {
+  S.clockMode = false;
+  S.stepBase = (S.boardStep || 0) + 1;
+  if (S.stepBase >= seg.totalSteps) return;
+  Metro.start(seg.bpm, ctx.currentTime + 0.05, 0, false, seg.totalSteps - S.stepBase, seg.kind === 'prog');
+}
+
+function tickInner() {
   if (!S.active) return;
   Metro.poll();
   const t = now();
@@ -1261,6 +1321,8 @@ function tick() {
         }
       }
     } else if (isBoardSeg(seg)) {
+      watchAudio(seg, t);
+      if (S.clockMode) { clockStep(seg, t); if (!S.active || S.phase !== 'play') return; renderLive(); return; }
       // Beat-driven drills end when their last beat has played. iPhone pauses the click
       // while the voice talks, so a clock would run out before the drill is finished.
       const done = Metro.limitReached && ctx && ctx.currentTime >= Metro.endTime - 0.02 && !Metro.queue.length;
@@ -1326,6 +1388,7 @@ function pause() {
     S.pausedFrom.pos = S.phase === 'play' ? songEl.currentTime : S.songStartPos;
   }
   Metro.stop(); stopSpeech(); songEl.pause();
+  S.clockMode = false;
   S.phase = 'paused';
   render();
 }
@@ -1601,7 +1664,7 @@ function showBoard(seg, force) {
     }
     const roundLen = 2 * (seg.pos.notes.length - 1);
     const round = Math.min(seg.rounds, Math.floor(Math.max(0, step - 1) / roundLen) + 1);
-    const cap = playing ? `Position ${seg.p} · round ${round} of ${seg.rounds}` : `Position ${seg.p} — start on the glowing note`;
+    const cap = playing ? `${posLabel(seg.p)} · round ${round} of ${seg.rounds}` : `${posLabel(seg.p)} — start on the glowing note`;
     if ($('s-caption').textContent !== cap) $('s-caption').textContent = cap;
     return;
   }
@@ -1716,10 +1779,10 @@ function render() {
   $('s-progress').textContent = `${kindLabel} · ${seg.item + 1} of ${itemCount}`;
   $('s-name').textContent = seg.name;
   const step = seg.ladder ? ` · step ${seg.ladder.k}/${seg.ladder.n}` : '';
-  if (seg.kind === 'scale') $('s-sub').textContent = `Position ${seg.p}${seg.all ? ' of 5' : ''} · ${seg.bpm} BPM`;
-  else if (seg.kind === 'prog') $('s-sub').textContent = `${seg.feel === 'shuffle' ? 'Shuffle' : 'Straight'} · ${seg.bpm} BPM · ${capFirst(PROG_MODES[seg.mode])}${seg.mode === 'tones' ? ' · ' + Theory.noteName(seg.key) + ' ' + Theory.SCALES[seg.scale].name + ', pos ' + seg.p : ''}`;
+  if (seg.kind === 'scale') $('s-sub').textContent = `${posLabel(seg.p)}${seg.all ? ' of 5' : ''} · ${seg.bpm} BPM`;
+  else if (seg.kind === 'prog') $('s-sub').textContent = `${seg.feel === 'shuffle' ? 'Shuffle' : 'Straight'} · ${seg.bpm} BPM · ${capFirst(PROG_MODES[seg.mode])}${seg.mode === 'tones' ? ' · ' + Theory.noteName(seg.key) + ' ' + Theory.SCALES[seg.scale].name + ', ' + posShort(seg.p) : ''}`;
   else if (seg.kind === 'noteFind') $('s-sub').textContent = `Frets 0–${seg.maxFret} · ${seg.bpm} BPM`;
-  else if (seg.kind === 'callResp') $('s-sub').textContent = `${seg.title} · position ${seg.p} · ${seg.bpm} BPM`;
+  else if (seg.kind === 'callResp') $('s-sub').textContent = `${seg.title} · ${posLower(seg.p)} · ${seg.bpm} BPM`;
   else if (seg.kind === 'exercise') $('s-sub').textContent = `${seg.bpm} BPM${step} · chord changes`;
   else if (board) $('s-sub').textContent = `${Theory.STRING_SETS[seg.set].label} strings · ${seg.bpm} BPM`;
   else $('s-sub').textContent = song ? `${seg.section} · ${seg.pct}%${step}` : `${seg.bpm} BPM${step}`;
@@ -1929,7 +1992,7 @@ const capFirst = t => t.charAt(0).toUpperCase() + t.slice(1);
 function itemName(it) {
   if (it.type === 'scale') {
     const sc = Theory.SCALES[it.scale] || Theory.SCALES.minPent;
-    return `🎼 ${Theory.noteName(num(it.key, 9))} ${sc.name}`;
+    return `🎼 ${Theory.noteName(num(it.key, 9))} ${sc.name}${it.positions === 'open' ? ' · open' : ''}`;
   }
   if (it.type === 'prog') {
     const pr = Theory.PROGRESSIONS[it.prog] || Theory.PROGRESSIONS.rock;
@@ -1942,7 +2005,7 @@ function itemName(it) {
   }
   if (it.type === 'callResp') {
     const sc = Theory.SCALES[it.scale] || Theory.SCALES.minPent;
-    return `👂 Call and response – ${Theory.noteName(num(it.key, 9))} ${sc.name}, pos ${num(it.p, 1)}`;
+    return `👂 Call and response – ${Theory.noteName(num(it.key, 9))} ${sc.name}, ${posShort(posValue(it.p))}`;
   }
   if (it.type === 'triad') {
     const q = it.quality === 'both' ? 'major & minor' : (it.quality || 'major');
@@ -2029,7 +2092,7 @@ function boardItemFields(it, i) {
     if (it.mode === 'tones') {
       h += `<div class="inline-fields">
         ${sel('scale', 'Scale', Theory.SCALE_ORDER.map(id => opt(id, it.scale || pr.scale, capFirst(Theory.SCALES[id].name))).join(''))}
-        ${sel('p', 'Position', [1, 2, 3, 4, 5].map(n => opt(n, it.p, n)).join(''))}
+        ${sel('p', 'Position', [1, 2, 3, 4, 5].map(n => opt(n, it.p, n)).join('') + opt('open', it.p, 'Open'))}
       </div>`;
     } else if (it.mode === 'triads') {
       h += sel('strings', 'Strings', Object.keys(Theory.STRING_SETS).map(k => opt(k, it.strings, Theory.STRING_SETS[k].label)).join(''));
@@ -2041,7 +2104,7 @@ function boardItemFields(it, i) {
     const lens = (from, to, cur) => { let o = ''; for (let n = from; n <= to; n++) o += opt(n, cur, n + ' notes'); return o; };
     h += `<div class="inline-fields">
       ${sel('scale', 'Scale', Theory.SCALE_ORDER.map(id => opt(id, it.scale, capFirst(Theory.SCALES[id].name))).join(''))}
-      ${sel('p', 'Position', [1, 2, 3, 4, 5].map(n => opt(n, it.p, n)).join(''))}
+      ${sel('p', 'Position', [1, 2, 3, 4, 5].map(n => opt(n, it.p, n)).join('') + opt('open', it.p, 'Open'))}
     </div>
     <div class="inline-fields">${numF('bpm', 'BPM', it.bpm)}${numF('prompts', 'Phrases', it.prompts)}</div>
     <div class="inline-fields">${sel('len', 'Start with', lens(2, 6, it.len))}${sel('maxLen', 'Grow up to', lens(3, 10, it.maxLen))}</div>
@@ -2053,7 +2116,7 @@ function boardItemFields(it, i) {
     h += sel('scale', 'Scale', Theory.SCALE_ORDER.map(id => opt(id, it.scale, capFirst(Theory.SCALES[id].name))).join(''));
     h += `<div class="inline-fields">
       ${numF('bpm', 'BPM', it.bpm)}
-      ${sel('positions', 'Positions', opt('all', it.positions, 'All 5') + [1, 2, 3, 4, 5].map(p => opt(p, it.positions, 'Only ' + p)).join(''))}
+      ${sel('positions', 'Positions', opt('all', it.positions, 'All 5') + [1, 2, 3, 4, 5].map(p => opt(p, it.positions, 'Only ' + p)).join('') + opt('open', it.positions, 'Open position'))}
       ${sel('rounds', 'Up & down', oneToFour(it.rounds))}
     </div>
     <div class="inline-fields">
@@ -2102,13 +2165,13 @@ function boardSummary(it) {
   if (it.type === 'callResp') {
     const seg = callRespSegments(it, 0, 0)[0];
     const a = seg.phrases[0].notes.length, b = seg.phrases[seg.phrases.length - 1].notes.length;
-    return `${seg.phrases.length} phrases in ${seg.title}, position ${seg.p}, growing from ${a} to ${b} notes. Listen, play it back, then see it — about ${fmtShort(seg.duration)}.`;
+    return `${seg.phrases.length} phrases in ${seg.title}, ${posLower(seg.p)}, growing from ${a} to ${b} notes. Listen, play it back, then see it — about ${fmtShort(seg.duration)}.`;
   }
   const segs = it.type === 'scale' ? scaleSegments(it, 0, 0) : triadSegments(it, 0, 0);
   const total = fmtShort(segs.reduce((t, x, k) => t + x.duration + (k ? x.breakBefore : 0), 0));
   if (it.type === 'scale') {
     const r = clamp(Math.round(num(it.rounds, 2)), 1, 8);
-    return `${segs[0].name}: ${segs.length === 5 ? 'all 5 positions' : 'position ' + segs[0].p}, up and down ${timesText(r)} each — about ${total}.`;
+    return `${segs[0].name}: ${segs.length === 5 ? 'all 5 positions' : posLower(segs[0].p)}${segs[0].p === 'open' ? ' (root to root)' : ''}, up and down ${timesText(r)} each — about ${total}.`;
   }
   const keys = itemKeys(it).map(Theory.noteName).join(', ');
   const q = it.quality === 'both' ? 'major and minor' : (it.quality || 'major');
@@ -2316,8 +2379,9 @@ function updateDraftField(el) {
         if (pr) { it.bpm = pr.bpm; it.scale = pr.scale; if (pr.oneBar && num(it.reps, 4) > 3) it.reps = 2; }
       }
       if (el.type === 'checkbox') it[k] = el.checked;
-      else if (['bpm', 'rounds', 'posBreak', 'prompts', 'findBars', 'revealBars', 'bars', 'p', 'len', 'maxLen', 'maxFret', 'findSecs', 'revealSecs', 'barsPer', 'reps'].includes(k)) it[k] = Math.max(k === 'posBreak' ? 0 : 1, num(el.value, it[k]));
-      else if (k === 'positions') it[k] = el.value === 'all' ? 'all' : num(el.value, 1);
+      else if (['bpm', 'rounds', 'posBreak', 'prompts', 'findBars', 'revealBars', 'bars', 'len', 'maxLen', 'maxFret', 'findSecs', 'revealSecs', 'barsPer', 'reps'].includes(k)) it[k] = Math.max(k === 'posBreak' ? 0 : 1, num(el.value, it[k]));
+      else if (k === 'positions') it[k] = el.value === 'all' ? 'all' : el.value === 'open' ? 'open' : num(el.value, 1);
+      else if (k === 'p') it[k] = el.value === 'open' ? 'open' : num(el.value, 1);
       else it[k] = el.value;
     }
     else if (f === 'chordUse') {
@@ -2614,7 +2678,7 @@ function surpriseItem(kind, st) {
   }
   if (kind === 'scale') {
     const scale = rnd(['minPent', 'minPent', 'minPent', 'majPent', 'minBlues', 'minor', 'major', 'dorian', 'mixo']);
-    const key = rnd(COMMON_KEYS), p = rndInt(1, 5), bpm = rnd([70, 75, 80, 85, 90]);
+    const key = rnd(COMMON_KEYS), p = Math.random() < 0.2 ? 'open' : rndInt(1, 5), bpm = rnd([70, 75, 80, 85, 90]);
     const n = Theory.position(key, scale, p).notes.length;
     const target = rndInt(90, 150);
     const rounds = clamp(Math.round(target * bpm / 60 / (2 * (n - 1))), 1, 4);
@@ -2638,7 +2702,7 @@ function surpriseItem(kind, st) {
     if (st.drillFlip) {
       return { type: 'noteFind', keys: NATURALS.slice(), strs: rnd([[0, 1, 2, 3, 4, 5], [0, 1], [2, 3], [4, 5], [0, 1, 2]]), mode: 'mix', maxFret: 12, bpm: 70, prompts: rndInt(10, 14), timing: 'secs', findSecs: 5, revealSecs: 3, findBars: 2, revealBars: 1 };
     }
-    return { type: 'callResp', key: rnd(COMMON_KEYS), scale: rnd(['minPent', 'minPent', 'majPent']), p: rndInt(1, 2), bpm: 70, prompts: rndInt(6, 8), len: 3, maxLen: 5, labels: 'degrees' };
+    return { type: 'callResp', key: rnd(COMMON_KEYS), scale: rnd(['minPent', 'minPent', 'majPent']), p: Math.random() < 0.25 ? 'open' : rndInt(1, 2), bpm: 70, prompts: rndInt(6, 8), len: 3, maxLen: 5, labels: 'degrees' };
   }
   if (kind === 'band') {
     const progs = Theory.PROG_ORDER.filter(x => x !== st.lastProg);
@@ -3307,6 +3371,12 @@ function renderSettings() {
     <div class="card">
       <label class="field"><span>Get-ready time before the first item (seconds)</span><input type="number" inputmode="numeric" data-s="firstBreak" value="${settings.firstBreak}"></label>
     </div>
+    <h2>Problem log</h2>
+    <div class="card">
+      <p class="muted" style="margin-top:0">If something freezes or goes wrong, Roadie notes it here. Tap Copy and paste it to Claude.</p>
+      <pre id="probLog" class="problog"></pre>
+      <div class="row"><button class="btn" id="copyProb">Copy</button><button class="btn" id="clearProb">Clear</button></div>
+    </div>
     <h2>Backup</h2>
     <div class="card">
       <p class="muted" style="margin-top:0">Save your exercises, routines, song sections and settings to a small file, or load them back. Song audio files aren't included.</p>
@@ -3314,7 +3384,7 @@ function renderSettings() {
       <button class="btn wide" id="importBtn">Import backup</button>
       <input type="file" id="importFile" accept=".json,application/json" hidden>
     </div>
-    <p class="muted" style="text-align:center;margin-top:24px">Roadie · Phase 5</p>`;
+    <p class="muted" style="text-align:center;margin-top:24px">Roadie · v17</p>`;
   fillVoiceSelect($('voiceSel'));
 
   v.querySelectorAll('[data-s]').forEach(el => {
@@ -3356,6 +3426,23 @@ function renderSettings() {
     $('tipInfo').textContent = `Next tip: 1 of ${Theory.TIPS.length}. They start simple and build up.`;
     toast('Tips will start from the beginning');
   });
+  const showProblems = () => {
+    const list = LS.get('problems', []);
+    $('probLog').textContent = list.length
+      ? list.map(p => `${p.when} · ${p.where}: ${p.msg}${p.line ? '\n   ' + p.line : ''}`).join('\n')
+      : 'Nothing logged — all good.';
+  };
+  showProblems();
+  $('copyProb').addEventListener('click', async () => {
+    const text = `Roadie problem log (${navigator.userAgent})\n` + $('probLog').textContent;
+    try { await navigator.clipboard.writeText(text); toast('Copied — paste it into your chat with Claude'); }
+    catch (e) {
+      const r = document.createRange(); r.selectNodeContents($('probLog'));
+      const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+      toast('Selected — tap Copy in the menu');
+    }
+  });
+  $('clearProb').addEventListener('click', () => { LS.set('problems', []); showProblems(); toast('Problem log cleared'); });
   $('exportBtn').addEventListener('click', exportBackup);
   $('importBtn').addEventListener('click', () => $('importFile').click());
   $('importFile').addEventListener('change', importBackup);

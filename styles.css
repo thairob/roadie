@@ -299,6 +299,7 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .carrow { color: var(--dim); font-weight: 700; }
 .cadd select { flex: 1; min-width: 0; }
 #s-caption .ch.chname { font-family: inherit; font-weight: 900; margin-right: 3vw; }
+.problog { white-space: pre-wrap; word-break: break-word; font-size: 13px; color: var(--dim); background: #0f0f12; border: 1px solid var(--line); border-radius: 10px; padding: 10px; max-height: 220px; overflow: auto; margin: 0 0 10px; -webkit-user-select: text; user-select: text; }
 .fixed { padding: 12px; color: var(--dim); border: 1px dashed var(--line); border-radius: 10px; }
 .n.faint circle { opacity: 0.35; }
 .n.faint text { opacity: 0.45; }

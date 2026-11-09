@@ -44,6 +44,7 @@ const Theory = (() => {
   // One position: start from the 2-notes-per-string pentatonic box, then fill in
   // the scale's extra notes (blues notes, or the 2 extra notes of a 7-note scale).
   function position(rootPc, scaleId, p) {
+    if (p === 'open' || p === 0) return openPosition(rootPc, scaleId);
     const sc = SCALES[scaleId] || SCALES.minPent;
     const rootFret = pcOf(rootPc - 4);                // root on the low E string
     const box = [];
@@ -76,6 +77,27 @@ const Theory = (() => {
     notes.forEach(n => { n.pc = pcOf(n.midi); n.iv = pcOf(n.midi - rootPc); n.root = n.iv === 0; });
     lo = Math.min(...notes.map(n => n.f)); hi = Math.max(...notes.map(n => n.f));
     return { notes, lo, hi };
+  }
+
+  // Open position: scale notes in the first 4 frets, using open strings wherever possible,
+  // from the lowest root to the highest root (root to root)
+  function openPosition(rootPc, scaleId) {
+    const sc = SCALES[scaleId] || SCALES.minPent;
+    const pcs = new Set(sc.iv.map(i => pcOf(rootPc + i)));
+    const best = new Map();                          // midi → lowest-fret placement
+    for (let s = 0; s < 6; s++) for (let f = 0; f <= 4; f++) {
+      const midi = OPEN[s] + f;
+      if (!pcs.has(pcOf(midi))) continue;
+      const cur = best.get(midi);
+      if (!cur || f < cur.f) best.set(midi, { s, f, midi });
+    }
+    let notes = [...best.values()].sort((x, y) => x.midi - y.midi);
+    notes.forEach(n => { n.pc = pcOf(n.midi); n.iv = pcOf(n.midi - rootPc); n.root = n.iv === 0; });
+    const first = notes.findIndex(n => n.root);
+    let last = -1; notes.forEach((n, k) => { if (n.root) last = k; });
+    if (first >= 0 && last > first) notes = notes.slice(first, last + 1);
+    const fr = notes.map(n => n.f);
+    return { notes, lo: Math.min(...fr), hi: Math.max(...fr), open: true };
   }
 
   // Up and down the position: the first round goes up and back down, later rounds repeat
@@ -450,7 +472,7 @@ const Theory = (() => {
     PROGRESSIONS, PROG_ORDER, progChords, progChordList, powerChord, triadPath,
     STRING_NAMES, STRING_SHORT, notePlaces, makePhrases, TIPS,
     OPEN, MAX_FRET, TRIAD_MAX, NOTE_NAMES, CIRCLE, DEGREE, SCALES, SCALE_ORDER, STRING_SETS, INV_NAMES, INV_SHORT,
-    pcOf, noteName, spokenNote, position, scalePath, wholeNeck,
+    pcOf, noteName, spokenNote, position, openPosition, scalePath, wholeNeck,
     triadShapes, triadWalk, triadInstances, triadLabel, drawBoard, drawMini
   };
 })();
